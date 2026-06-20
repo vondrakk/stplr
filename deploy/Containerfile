@@ -1,0 +1,41 @@
+# stplr cluster image — runs `stplrd`, the substrate server.
+#
+# The same image runs any stplrd role (today: a shard; coordinator/api follow with the HA work);
+# the Helm chart selects the role + flags via the container `command`/args. Build once, deploy as
+# the shard StatefulSet (and, once served, the coordinator).
+#
+# Build:  podman build -t stplr:0.1.0 -f deploy/Containerfile .
+# Shard:  podman run -p 8100:8100 -v stplrdata:/var/lib/stplr stplr:0.1.0
+#
+# ---- build stage: Rust toolchain + LMDB native build deps ----
+FROM docker.io/library/rust:1-bookworm AS build
+WORKDIR /src
+# heed (LMDB) builds a C library and generates bindings — needs a C compiler + libclang.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+# Cache deps: copy manifests first, then sources.
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --bin stplrd && strip target/release/stplrd
+
+# ---- runtime stage: slim glibc, no toolchain ----
+FROM docker.io/library/debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/stplrd /usr/local/bin/stplrd
+
+# Durable LMDB lives here; the chart mounts a PVC at this path.
+ENV STPLR_DATA=/var/lib/stplr
+
+# OpenShift assigns an arbitrary uid in the root (0) group; keep things group-writable.
+RUN useradd -r -u 10001 -m stplr \
+    && mkdir -p /var/lib/stplr \
+    && chown -R 10001:0 /var/lib/stplr \
+    && chmod -R g=u /var/lib/stplr
+USER 10001
+
+# shard server port (chart sets containerPort authoritatively)
+EXPOSE 8100
+# Default role: a durable shard. The chart overrides args per role.
+CMD ["stplrd", "--bind", "0.0.0.0:8100", "--store", "lmdb", "--path", "/var/lib/stplr"]
