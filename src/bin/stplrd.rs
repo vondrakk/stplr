@@ -44,6 +44,21 @@ struct Args {
     shard_name: Option<String>,
     shard_domain: Option<String>,
     shard_port: u16,
+    // In-process TLS. Server: cert+key (both required) enable TLS on the binary + HTTP transports.
+    // Client (coordinator -> shard): a CA to trust, or insecure to skip verification (dev).
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
+    tls_ca: Option<String>,
+    tls_insecure: bool,
+}
+
+/// Build the server TLS materials from `--tls-cert`/`--tls-key` (None when neither is set).
+fn build_server_tls(args: &Args) -> anyhow::Result<Option<stplr::tls::ServerTls>> {
+    match (&args.tls_cert, &args.tls_key) {
+        (Some(cert), Some(key)) => Ok(Some(stplr::tls::ServerTls::from_pem(cert, key)?)),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!("--tls-cert and --tls-key must be given together"),
+    }
 }
 
 fn print_help() {
@@ -69,6 +84,10 @@ fn print_help() {
          \x20 --lease-ttl-ms <N>  leader lease TTL in ms (default 10000)     [coordinator]\n\
          \x20 --ingest-queue <DIR>  durable write-ahead ingest queue at DIR  [coordinator]\n\
          \x20 --auth-token <TOK>  require Bearer <TOK> on the API (or env STPLR_AUTH_TOKEN)\n\
+         \x20 --tls-cert <FILE>   PEM cert chain — enables TLS on the binary + HTTP transports (with --tls-key)\n\
+         \x20 --tls-key <FILE>    PEM private key for --tls-cert\n\
+         \x20 --tls-ca <FILE>     PEM CA to trust for coordinator->shard https (client side)\n\
+         \x20 --tls-insecure      skip cert verification on client connections (DEV ONLY)\n\
          \x20 --verify-snapshot <FILE>  inspect a backup snapshot (read-only) and exit\n\
          \x20 -h, --help         this help"
     );
@@ -110,6 +129,10 @@ fn parse_args() -> Args {
         shard_name: None,
         shard_domain: None,
         shard_port: 8100,
+        tls_cert: None,
+        tls_key: None,
+        tls_ca: None,
+        tls_insecure: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -133,6 +156,10 @@ fn parse_args() -> Args {
             "--shard-name" => a.shard_name = it.next(),
             "--shard-domain" => a.shard_domain = it.next(),
             "--shard-port" => a.shard_port = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.shard_port),
+            "--tls-cert" => a.tls_cert = it.next(),
+            "--tls-key" => a.tls_key = it.next(),
+            "--tls-ca" => a.tls_ca = it.next(),
+            "--tls-insecure" => a.tls_insecure = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -193,9 +220,11 @@ async fn run_coordinator(args: &Args) -> anyhow::Result<()> {
         None => None,
     };
     let elect = args.coordinator_id.clone().map(|id| (id, args.lease_ttl_ms));
+    let server_tls = build_server_tls(args)?;
     let addr: SocketAddr = args.bind.parse().map_err(|e| anyhow::anyhow!("bad --bind '{}': {e}", args.bind))?;
     eprintln!(
-        "stplrd coordinator on http://{addr} ({n} shards, replication {}{}{}{})",
+        "stplrd coordinator on {}://{addr} ({n} shards, replication {}{}{}{})",
+        if server_tls.is_some() { "https" } else { "http" },
         args.replication,
         if racks > 0 { format!(", rack-aware across {racks} mapped nodes") } else { String::new() },
         match &args.coordinator_id {
@@ -207,7 +236,7 @@ async fn run_coordinator(args: &Args) -> anyhow::Result<()> {
             None => String::new(),
         }
     );
-    stplr::coord::serve_addr_full(addr, cluster, elect, queue, args.auth_token.clone()).await?;
+    stplr::coord::serve_addr_full(addr, cluster, elect, queue, args.auth_token.clone(), server_tls).await?;
     Ok(())
 }
 
@@ -215,6 +244,8 @@ async fn run_coordinator(args: &Args) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let args = parse_args();
     stplr::metrics::init();
+    // Cluster-wide client TLS (coordinator -> shard hop) is process-global; set once here.
+    stplr::tls::set_client_tls(stplr::tls::ClientTls { ca_pem: args.tls_ca.clone(), insecure: args.tls_insecure });
 
     // Backup inspection mode: validate a snapshot file (read-only) and exit. Non-zero exit on a
     // bad/empty backup so an operator/CI check can gate on it.
@@ -258,27 +289,31 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // TLS materials (cert+key) shared by both transports; None = plaintext (trusted mesh).
+    let server_tls = build_server_tls(&args)?;
+
     // Optional binary protocol on its own port, sharing the same shard state.
     if let Some(b) = &args.bin_bind {
         let baddr: SocketAddr = b.parse().map_err(|e| anyhow::anyhow!("bad --bin-bind '{b}': {e}"))?;
         let bstate = state.clone();
         let btoken = args.auth_token.clone();
-        eprintln!("stplrd '{}' binary protocol on {}", args.id, baddr);
+        let btls = server_tls.clone();
+        eprintln!("stplrd '{}' binary protocol on {}{}", args.id, baddr, if btls.is_some() { " (TLS)" } else { "" });
         tokio::spawn(async move {
-            let _ = stplr::proto::serve_addr(baddr, bstate, btoken).await;
+            let _ = stplr::proto::serve_addr_tls(baddr, bstate, btoken, btls).await;
         });
     }
 
     let addr: SocketAddr = args.bind.parse().map_err(|e| anyhow::anyhow!("bad --bind '{}': {e}", args.bind))?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!(
-        "stplrd '{}' listening on http://{} (store={}{}{})",
+        "stplrd '{}' listening on {}://{} (store={}{}{})",
         args.id,
+        if server_tls.is_some() { "https" } else { "http" },
         addr,
         args.store,
         if args.store == "lmdb" { format!(", path={}", args.path.display()) } else { String::new() },
         if args.auth_token.is_some() { ", bearer-auth" } else { "" }
     );
-    axum::serve(listener, stplr::net::require_bearer(app(state), args.auth_token)).await?;
+    stplr::tls::serve_router(addr, stplr::net::require_bearer(app(state), args.auth_token), server_tls).await?;
     Ok(())
 }

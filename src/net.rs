@@ -332,6 +332,7 @@ impl HttpShardClient {
                 builder = builder.default_headers(h);
             }
         }
+        builder = crate::tls::client_tls().apply(builder); // trust the cluster CA for https shards
         let http = builder.build().unwrap_or_else(|_| reqwest::Client::new());
         Self { id: id.to_string(), base: base.trim_end_matches('/').to_string(), http }
     }
