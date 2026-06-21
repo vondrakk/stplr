@@ -30,6 +30,9 @@ impl<St: IndexStore> Shard<St> {
     pub fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String> {
         self.store.scan_range(coll, after, prefix, end, limit)
     }
+    pub fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
+        self.store.mget(coll, keys)
+    }
 
     // --- generic posting-list set ops (cluster-routed) ---
     pub fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool {

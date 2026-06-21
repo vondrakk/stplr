@@ -54,6 +54,7 @@ async fn bearer_layer(State(token): State<Arc<String>>, req: Request, next: Next
 /// block each other); only mutations take the exclusive write lock.
 pub trait ShardOps: Send + Sync {
     fn object(&self, coll: &str, key: &str) -> Option<Value>;
+    fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>>;
     fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String>;
     fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool;
     fn set_remove(&mut self, coll: &str, key: &str, member: &str) -> bool;
@@ -77,6 +78,9 @@ pub trait ShardOps: Send + Sync {
 impl<St: IndexStore + Send + Sync> ShardOps for Shard<St> {
     fn object(&self, coll: &str, key: &str) -> Option<Value> {
         Shard::object(self, coll, key)
+    }
+    fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
+        Shard::mget(self, coll, keys)
     }
     fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String> {
         Shard::scan_range(self, coll, after, prefix, end, limit)
@@ -158,6 +162,11 @@ fn default_scan_limit() -> usize {
     1000
 }
 #[derive(Serialize, Deserialize)]
+struct MgetBody {
+    coll: String,
+    keys: Vec<String>,
+}
+#[derive(Serialize, Deserialize)]
 struct SetBody {
     coll: String,
     key: String,
@@ -222,6 +231,7 @@ pub fn app(state: SharedShard) -> Router {
         .route("/metrics", get(|| async { crate::metrics::render() }))
         .route("/caps", get(caps))
         .route("/object", get(object))
+        .route("/mget", post(mget))
         .route("/scan", get(scan))
         .route("/setAdd", post(set_add))
         .route("/setRemove", post(set_remove))
@@ -244,6 +254,12 @@ async fn caps(State(s): State<SharedShard>) -> Json<Value> {
 async fn object(State(s): State<SharedShard>, Query(q): Query<ObjQ>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::GET);
     Json(json!({ "object": s.read().unwrap().object(&q.coll, &q.key) }))
+}
+/// Batch get on this shard — one value (or null) per requested key, in order (read op).
+async fn mget(State(s): State<SharedShard>, Json(b): Json<MgetBody>) -> Json<Value> {
+    crate::metrics::inc(&crate::metrics::GET);
+    let vals = s.read().unwrap().mget(&b.coll, &b.keys);
+    Json(json!({ "values": vals }))
 }
 /// Paginated key iteration on this shard with optional prefix/end bounds (read op). `limit` is
 /// capped to keep a page bounded.
@@ -390,6 +406,21 @@ impl ShardClient for HttpShardClient {
             .await
             .map_err(|e| e.to_string())?;
         Ok(v.get("object").cloned().filter(|o| !o.is_null()))
+    }
+
+    async fn mget(&self, coll: &str, keys: &[String]) -> CResult<Vec<Option<Value>>> {
+        let body = MgetBody { coll: coll.into(), keys: keys.to_vec() };
+        let v: Value = self
+            .http
+            .post(format!("{}/mget", self.base))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::from_value(v.get("values").cloned().unwrap_or(Value::Null)).unwrap_or_default())
     }
 
     async fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> CResult<Vec<String>> {

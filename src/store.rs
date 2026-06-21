@@ -61,6 +61,11 @@ pub trait IndexStore {
     fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> Vec<String> {
         self.scan_range(coll, after, None, None, limit)
     }
+    /// Fetch many keys at once, returning a value (or `None`) per key, in input order. The default
+    /// loops `get_object`; the network win is at the cluster layer (one request per shard).
+    fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
+        keys.iter().map(|k| self.get_object(coll, k)).collect()
+    }
     fn clear_collection(&mut self, coll: &str);
     fn delete_object(&mut self, coll: &str, id: &str);
 

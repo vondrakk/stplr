@@ -115,6 +115,11 @@ fn default_scan_limit() -> usize {
     1000
 }
 #[derive(Deserialize)]
+struct MgetBody {
+    coll: String,
+    keys: Vec<String>,
+}
+#[derive(Deserialize)]
 struct WriteBody {
     coll: String,
     key: String,
@@ -157,6 +162,7 @@ pub fn app(cluster: Co) -> Router {
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
         .route("/metrics", get(metrics))
         .route("/object", get(object))
+        .route("/mget", post(mget))
         .route("/scan", get(scan))
         .route("/write", post(write))
         .route("/cas", post(cas))
@@ -183,6 +189,11 @@ async fn metrics(State(c): State<Co>) -> String {
 async fn object(State(c): State<Co>, Query(q): Query<ObjQ>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::GET);
     Json(json!({ "object": c.get(&q.coll, &q.key).await }))
+}
+/// Cluster-wide batch get: one value (or null) per key, in order — keys routed to their shards and
+/// batched one request per shard.
+async fn mget(State(c): State<Co>, Json(b): Json<MgetBody>) -> Json<Value> {
+    Json(json!({ "values": c.mget(&b.coll, &b.keys).await }))
 }
 /// Cluster-wide paginated key iteration: fan out to all shards, merge into one ascending page +
 /// a `cursor` to pass back as `?after=` for the next page (null when the collection is drained).
@@ -439,6 +450,28 @@ mod tests {
         // Empty/unknown collection yields an empty drained page.
         let (page, cursor) = cluster.scan_keys("nope", None, 10).await;
         assert!(page.is_empty() && cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn mget_batches_across_shards_in_order() {
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["s0", "s1", "s2"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            clients.insert(id.to_string(), Arc::new(HttpShardClient::new(id, &format!("http://{addr}"))));
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+        for k in ["a", "b", "c", "d"] {
+            cluster.put("kv", k, json!(format!("V-{k}"))).await;
+        }
+        // mixed present/absent, result aligned to input order
+        let keys: Vec<String> = ["c", "missing", "a", "d", "b"].iter().map(|s| s.to_string()).collect();
+        let got = cluster.mget("kv", &keys).await;
+        assert_eq!(
+            got,
+            vec![Some(json!("V-c")), None, Some(json!("V-a")), Some(json!("V-d")), Some(json!("V-b"))]
+        );
+        // empty request -> empty result
+        assert!(cluster.mget("kv", &[]).await.is_empty());
     }
 
     #[tokio::test]
