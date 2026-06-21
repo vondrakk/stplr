@@ -135,6 +135,53 @@ impl IngestQueue {
         *self.committed.lock().unwrap() = seq;
     }
 
+    /// Trim the WAL behind the committed cursor: delete already-applied entries (seq <= committed),
+    /// which are safe to drop since replay only ever resumes from `committed + 1`. Returns how many
+    /// were removed. This bounds the queue's disk growth — without it the log is append-only forever.
+    pub fn compact(&self) -> usize {
+        let committed = self.committed();
+        if committed == 0 {
+            return 0;
+        }
+        // Collect applied keys (sorted; stop once past the cursor), then delete them in one txn.
+        let to_delete: Vec<String> = {
+            let rtxn = match self.env.read_txn() {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            let iter = match self.queue.iter(&rtxn) {
+                Ok(i) => i,
+                Err(_) => return 0,
+            };
+            let mut ks = Vec::new();
+            for item in iter.flatten() {
+                match item.0.parse::<u64>() {
+                    Ok(seq) if seq <= committed => ks.push(item.0.to_string()),
+                    Ok(_) => break, // sorted keys: past the committed cursor, done
+                    Err(_) => continue,
+                }
+            }
+            ks
+        };
+        if to_delete.is_empty() {
+            return 0;
+        }
+        let mut wtxn = match self.env.write_txn() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let mut removed = 0;
+        for k in &to_delete {
+            if self.queue.delete(&mut wtxn, k).unwrap_or(false) {
+                removed += 1;
+            }
+        }
+        if wtxn.commit().is_err() {
+            return 0;
+        }
+        removed
+    }
+
     /// Apply up to `limit` accepted-but-unapplied ops to `sink`, in order, advancing the durable
     /// committed cursor to the last success. Stops at the first failure (that op is retried on the
     /// next drain). Returns how many were applied. Idempotent replay makes a partial drain safe.
@@ -154,6 +201,7 @@ impl IngestQueue {
         }
         if last_ok > from {
             self.persist_committed(last_ok);
+            self.compact(); // drop the just-applied entries; keeps the WAL bounded
         }
         applied
     }
@@ -233,6 +281,26 @@ mod tests {
         assert_eq!(*sink.applied.lock().unwrap(), vec![put("a"), put("b"), put("c")]);
         // draining again is a no-op (nothing uncommitted)
         assert_eq!(q.drain(&sink, 1024).await, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn compact_trims_applied_but_keeps_uncommitted() {
+        let dir = tmp("compact");
+        let q = IngestQueue::open(&dir, 16 * 1024 * 1024).unwrap();
+        for k in ["a", "b", "c", "d", "e"] {
+            q.enqueue(&put(k));
+        }
+        let sink = MockSink { fail_after: Mutex::new(usize::MAX), ..Default::default() };
+        // apply only the first 2 (drain auto-compacts the entries it just committed)
+        assert_eq!(q.drain(&sink, 2).await, 2);
+        assert_eq!(q.committed(), 2);
+        assert_eq!(q.pending(), 3, "c,d,e still uncommitted");
+        assert_eq!(q.compact(), 0, "applied entries already trimmed; nothing more to drop");
+        // the uncommitted tail survived compaction and still drains correctly
+        assert_eq!(q.drain(&sink, 1024).await, 3);
+        assert_eq!(q.committed(), 5);
+        assert_eq!(*sink.applied.lock().unwrap(), vec![put("a"), put("b"), put("c"), put("d"), put("e")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

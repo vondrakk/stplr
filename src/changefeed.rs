@@ -10,6 +10,7 @@
 //! sequencer.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -34,6 +35,18 @@ pub trait ChangeLog: Send + Sync {
     fn read(&self, since: u64, limit: usize) -> Vec<ChangeEvent>;
     /// Highest sequence number written so far (0 if empty).
     fn latest_seq(&self) -> u64;
+    /// Drop all events with seq < `before` (retention/compaction). Returns how many were removed.
+    /// Consumers that already read past `before` lose nothing; ones that haven't skip the gap.
+    fn compact(&self, before: u64) -> usize;
+    /// Keep only the most recent `max` events, compacting everything older. Returns removed count.
+    fn retain_latest(&self, max: u64) -> usize {
+        let latest = self.latest_seq();
+        if latest > max {
+            self.compact(latest - max + 1)
+        } else {
+            0
+        }
+    }
 }
 
 /// 20-digit zero-padded key so lexical order == numeric order for range scans.
@@ -41,10 +54,12 @@ fn key(seq: u64) -> String {
     format!("{seq:020}")
 }
 
-/// Non-durable log for dev/tests.
+/// Non-durable log for dev/tests. `next` is a monotonic seq counter independent of the buffer
+/// length, so sequence numbers stay unique and increasing across compaction (which shrinks `inner`).
 #[derive(Default)]
 pub struct MemoryChangeLog {
     inner: Mutex<Vec<ChangeEvent>>,
+    next: AtomicU64,
 }
 
 impl MemoryChangeLog {
@@ -55,9 +70,14 @@ impl MemoryChangeLog {
 
 impl ChangeLog for MemoryChangeLog {
     fn append(&self, op: &str, value: &str, set: &str, doc_id: &str) -> u64 {
-        let mut v = self.inner.lock().unwrap();
-        let seq = v.len() as u64 + 1;
-        v.push(ChangeEvent { seq, op: op.into(), value: value.into(), set: set.into(), doc_id: doc_id.into() });
+        let seq = self.next.fetch_add(1, Ordering::SeqCst) + 1; // monotonic, survives compaction
+        self.inner.lock().unwrap().push(ChangeEvent {
+            seq,
+            op: op.into(),
+            value: value.into(),
+            set: set.into(),
+            doc_id: doc_id.into(),
+        });
         seq
     }
     fn read(&self, since: u64, limit: usize) -> Vec<ChangeEvent> {
@@ -65,7 +85,13 @@ impl ChangeLog for MemoryChangeLog {
         v.iter().filter(|e| e.seq > since).take(limit).cloned().collect()
     }
     fn latest_seq(&self) -> u64 {
-        self.inner.lock().unwrap().len() as u64
+        self.next.load(Ordering::SeqCst)
+    }
+    fn compact(&self, before: u64) -> usize {
+        let mut v = self.inner.lock().unwrap();
+        let n = v.len();
+        v.retain(|e| e.seq >= before);
+        n - v.len()
     }
 }
 
@@ -137,6 +163,48 @@ impl ChangeLog for LmdbChangeLog {
     fn latest_seq(&self) -> u64 {
         self.next.lock().unwrap().saturating_sub(1)
     }
+    fn compact(&self, before: u64) -> usize {
+        if before <= 1 {
+            return 0;
+        }
+        // Collect keys for events with seq < before (sorted; stop once we reach it), then delete.
+        let to_delete: Vec<String> = {
+            let rtxn = match self.env.read_txn() {
+                Ok(t) => t,
+                Err(_) => return 0,
+            };
+            let iter = match self.db.iter(&rtxn) {
+                Ok(i) => i,
+                Err(_) => return 0,
+            };
+            let mut ks = Vec::new();
+            for item in iter.flatten() {
+                match item.0.parse::<u64>() {
+                    Ok(seq) if seq < before => ks.push(item.0.to_string()),
+                    Ok(_) => break,
+                    Err(_) => continue,
+                }
+            }
+            ks
+        };
+        if to_delete.is_empty() {
+            return 0;
+        }
+        let mut wtxn = match self.env.write_txn() {
+            Ok(t) => t,
+            Err(_) => return 0,
+        };
+        let mut removed = 0;
+        for k in &to_delete {
+            if self.db.delete(&mut wtxn, k).unwrap_or(false) {
+                removed += 1;
+            }
+        }
+        if wtxn.commit().is_err() {
+            return 0;
+        }
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -164,6 +232,40 @@ mod tests {
 
         // caught up
         assert!(log.read(3, 100).is_empty());
+    }
+
+    fn exercise_retention(log: &dyn ChangeLog) {
+        for i in 0..10 {
+            log.append("add", &format!("v{i}"), "s", "d");
+        }
+        assert_eq!(log.latest_seq(), 10);
+        // keep the last 3 -> drops seq 1..=7
+        assert_eq!(log.retain_latest(3), 7);
+        let all = log.read(0, 100);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].seq, 8, "oldest surviving event is seq 8");
+        // explicit compact below 9 -> drops seq 8
+        assert_eq!(log.compact(9), 1);
+        assert_eq!(log.read(0, 100).len(), 2);
+        // retain more than present is a no-op; latest_seq unchanged (monotonic)
+        assert_eq!(log.retain_latest(100), 0);
+        assert_eq!(log.latest_seq(), 10);
+    }
+
+    #[test]
+    fn memory_retention() {
+        exercise_retention(&MemoryChangeLog::new());
+    }
+
+    #[test]
+    fn lmdb_retention() {
+        let dir = std::env::temp_dir().join(format!("stplr-cf-ret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let log = LmdbChangeLog::open(&dir, 16 * 1024 * 1024).unwrap();
+            exercise_retention(&log);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
