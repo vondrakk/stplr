@@ -1,0 +1,66 @@
+name: Activity notifications
+
+# Push an ntfy notification when anyone OTHER THAN the owner does something on the repo:
+# opens/closes a PR or issue, comments, forks, stars, or cuts a release. Event-driven (no polling).
+# The ntfy URL lives in the NTFY_URL repo secret, so the topic is not exposed in this public file.
+# `pull_request_target` (not `pull_request`) so secrets are available for PRs opened from forks.
+# This job never checks out or runs PR code — it only reads event metadata — so fork PRs are safe.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, closed, ready_for_review]
+  issues:
+    types: [opened, reopened, closed]
+  issue_comment:
+    types: [created]
+  fork:
+  watch:
+    types: [started]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    # Skip the owner's own activity.
+    if: ${{ github.actor != 'vondrakk' }}
+    steps:
+      - name: Push ntfy notification
+        env:
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          ACTION: ${{ github.event.action }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          RELEASE_NAME: ${{ github.event.release.name }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          REPO_URL: ${{ github.event.repository.html_url }}
+        run: |
+          if [ -z "$NTFY_URL" ]; then echo "NTFY_URL secret not set — skipping"; exit 0; fi
+          case "$EVENT" in
+            pull_request_target)
+              TITLE="PR #$PR_NUM $ACTION by $ACTOR"; BODY="$PR_TITLE"; LINK="$PR_URL"; TAGS="twisted_rightwards_arrows" ;;
+            issues)
+              TITLE="Issue #$ISSUE_NUM $ACTION by $ACTOR"; BODY="$ISSUE_TITLE"; LINK="$ISSUE_URL"; TAGS="speech_balloon" ;;
+            issue_comment)
+              TITLE="Comment by $ACTOR on #$ISSUE_NUM"; BODY="$ISSUE_TITLE"; LINK="$COMMENT_URL"; TAGS="speech_balloon" ;;
+            fork)
+              TITLE="Forked by $ACTOR"; BODY="$ACTOR forked stplr"; LINK="$REPO_URL"; TAGS="fork_and_knife" ;;
+            watch)
+              TITLE="New star from $ACTOR"; BODY="$ACTOR starred stplr"; LINK="$REPO_URL"; TAGS="star" ;;
+            release)
+              TITLE="Release: $RELEASE_NAME"; BODY="published by $ACTOR"; LINK="$RELEASE_URL"; TAGS="rocket" ;;
+            *)
+              TITLE="$EVENT by $ACTOR"; BODY="$EVENT"; LINK="$REPO_URL"; TAGS="bell" ;;
+          esac
+          curl -s -H "Title: stplr — $TITLE" -H "Tags: $TAGS" -H "Click: $LINK" -d "$BODY" "$NTFY_URL" >/dev/null
+          echo "notified: $TITLE"
