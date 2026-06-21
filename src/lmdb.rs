@@ -285,6 +285,42 @@ impl IndexStore for LmdbStore {
             entries
         }
     }
+
+    /// Cursor range scan: seek past `after` and walk forward up to `limit` keys (LMDB stores keys
+    /// sorted, so this never loads the whole collection — the win over the trait default).
+    fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> Vec<String> {
+        use std::ops::Bound;
+        let Some(db) = self.read_db(&Self::obj_db(coll)) else {
+            return Vec::new();
+        };
+        let rtxn = match self.env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let lower = match after {
+            Some(a) => Bound::Excluded(a),
+            None => Bound::Unbounded,
+        };
+        let range: (Bound<&str>, Bound<&str>) = (lower, Bound::Unbounded);
+        let iter = match db.range(&rtxn, &range) {
+            Ok(i) => i,
+            Err(_) => return Vec::new(),
+        };
+        let check_ttl = self.has_any_ttl.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        for item in iter {
+            if out.len() >= limit {
+                break;
+            }
+            if let Ok((k, _)) = item {
+                if check_ttl && self.is_expired(coll, k) {
+                    continue;
+                }
+                out.push(k.to_string());
+            }
+        }
+        out
+    }
     fn clear_collection(&mut self, coll: &str) {
         let Some(db) = self.read_db(&Self::obj_db(coll)) else {
             return;

@@ -27,6 +27,9 @@ impl<St: IndexStore> Shard<St> {
     pub fn object(&self, coll: &str, key: &str) -> Option<Value> {
         self.store.get_object(coll, key)
     }
+    pub fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> Vec<String> {
+        self.store.scan_keys(coll, after, limit)
+    }
 
     // --- generic posting-list set ops (cluster-routed) ---
     pub fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool {
