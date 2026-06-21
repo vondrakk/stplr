@@ -104,6 +104,10 @@ struct ScanQ {
     coll: String,
     #[serde(default)]
     after: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
     #[serde(default = "default_scan_limit")]
     limit: usize,
 }
@@ -183,7 +187,8 @@ async fn object(State(c): State<Co>, Query(q): Query<ObjQ>) -> Json<Value> {
 /// Cluster-wide paginated key iteration: fan out to all shards, merge into one ascending page +
 /// a `cursor` to pass back as `?after=` for the next page (null when the collection is drained).
 async fn scan(State(c): State<Co>, Query(q): Query<ScanQ>) -> Json<Value> {
-    let (keys, cursor) = c.scan_keys(&q.coll, q.after.as_deref(), q.limit.min(10_000)).await;
+    let (keys, cursor) =
+        c.scan_range(&q.coll, q.after.as_deref(), q.prefix.as_deref(), q.end.as_deref(), q.limit.min(10_000)).await;
     Json(json!({ "keys": keys, "cursor": cursor }))
 }
 async fn write(State(c): State<Co>, Json(b): Json<WriteBody>) -> Json<Value> {
@@ -434,6 +439,35 @@ mod tests {
         // Empty/unknown collection yields an empty drained page.
         let (page, cursor) = cluster.scan_keys("nope", None, 10).await;
         assert!(page.is_empty() && cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_range_prefix_and_bounds() {
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["s0", "s1", "s2"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            clients.insert(id.to_string(), Arc::new(HttpShardClient::new(id, &format!("http://{addr}"))));
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+        for k in ["user:01", "user:02", "user:03", "order:01", "order:02", "zzz"] {
+            cluster.put("kv", k, json!(k)).await;
+        }
+
+        // prefix: only the user: keys, in order
+        let (page, _) = cluster.scan_range("kv", None, Some("user:"), None, 100).await;
+        assert_eq!(page, vec!["user:01", "user:02", "user:03"]);
+
+        // half-open range [order:02, user:02): order:02, user:01
+        let (page, _) = cluster.scan_range("kv", None, None, Some("user:02"), 100).await;
+        assert!(page.contains(&"order:01".to_string()) && page.contains(&"user:01".to_string()));
+        assert!(!page.contains(&"user:02".to_string()), "end bound is exclusive");
+        assert!(!page.contains(&"zzz".to_string()), "beyond end excluded");
+
+        // prefix + cursor pagination
+        let (p1, cur) = cluster.scan_range("kv", None, Some("user:"), None, 2).await;
+        assert_eq!(p1, vec!["user:01", "user:02"]);
+        let (p2, _) = cluster.scan_range("kv", cur.as_deref(), Some("user:"), None, 2).await;
+        assert_eq!(p2, vec!["user:03"], "cursor resumes within the prefix");
     }
 
     // Two coordinators over the SAME shards (same node ids → same lease arbiter shard). Exercises

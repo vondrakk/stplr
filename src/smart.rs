@@ -210,17 +210,29 @@ impl SmartClient {
 
     /// Paginated key iteration across every shard, merged + de-duplicated into one ascending page
     /// of at most `limit`. Returns `(page, next_cursor)`; pass `next_cursor` back as `after`.
-    pub async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> (Vec<String>, Option<String>) {
+    pub async fn scan_range(
+        &self,
+        coll: &str,
+        after: Option<&str>,
+        prefix: Option<&str>,
+        end: Option<&str>,
+        limit: usize,
+    ) -> (Vec<String>, Option<String>) {
         let clients: Vec<Arc<dyn ShardClient>> = self.clients.read().unwrap().values().cloned().collect();
         let mut merged = std::collections::BTreeSet::new();
         for c in clients {
-            if let Ok(keys) = c.scan_keys(coll, after, limit).await {
+            if let Ok(keys) = c.scan_range(coll, after, prefix, end, limit).await {
                 merged.extend(keys);
             }
         }
         let page: Vec<String> = merged.into_iter().take(limit).collect();
         let cursor = if page.len() >= limit { page.last().cloned() } else { None };
         (page, cursor)
+    }
+
+    /// Cursor-only iteration — `scan_range` with no prefix/end bound.
+    pub async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> (Vec<String>, Option<String>) {
+        self.scan_range(coll, after, None, None, limit).await
     }
 
     /// Write to every replica of `key`.

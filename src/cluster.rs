@@ -241,20 +241,32 @@ impl Cluster {
     /// than `after` (ascending); results are merged + de-duplicated (a key lives on R replicas) into
     /// one ascending page of at most `limit`. Returns `(page, next_cursor)` where `next_cursor` is
     /// the last key when a full page came back (pass it as the next `after`), else `None` (drained).
-    pub async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> (Vec<String>, Option<String>) {
+    pub async fn scan_range(
+        &self,
+        coll: &str,
+        after: Option<&str>,
+        prefix: Option<&str>,
+        end: Option<&str>,
+        limit: usize,
+    ) -> (Vec<String>, Option<String>) {
         let clients: Vec<Arc<dyn ShardClient>> = self.clients.read().unwrap().values().cloned().collect();
         let mut merged = std::collections::BTreeSet::new();
         for c in clients {
             if self.is_down(c.id()) {
                 continue;
             }
-            if let Ok(keys) = c.scan_keys(coll, after, limit).await {
+            if let Ok(keys) = c.scan_range(coll, after, prefix, end, limit).await {
                 merged.extend(keys);
             }
         }
         let page: Vec<String> = merged.into_iter().take(limit).collect();
         let cursor = if page.len() >= limit { page.last().cloned() } else { None };
         (page, cursor)
+    }
+
+    /// Cursor-only iteration — `scan_range` with no prefix/end bound.
+    pub async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> (Vec<String>, Option<String>) {
+        self.scan_range(coll, after, None, None, limit).await
     }
 
     pub async fn get(&self, coll: &str, key: &str) -> Option<Value> {

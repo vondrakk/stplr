@@ -54,7 +54,7 @@ async fn bearer_layer(State(token): State<Arc<String>>, req: Request, next: Next
 /// block each other); only mutations take the exclusive write lock.
 pub trait ShardOps: Send + Sync {
     fn object(&self, coll: &str, key: &str) -> Option<Value>;
-    fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> Vec<String>;
+    fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String>;
     fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool;
     fn set_remove(&mut self, coll: &str, key: &str, member: &str) -> bool;
     fn write_object(&mut self, coll: &str, key: &str, obj: Value);
@@ -78,8 +78,8 @@ impl<St: IndexStore + Send + Sync> ShardOps for Shard<St> {
     fn object(&self, coll: &str, key: &str) -> Option<Value> {
         Shard::object(self, coll, key)
     }
-    fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> Vec<String> {
-        Shard::scan_keys(self, coll, after, limit)
+    fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String> {
+        Shard::scan_range(self, coll, after, prefix, end, limit)
     }
     fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool {
         Shard::set_add(self, coll, key, member)
@@ -147,6 +147,10 @@ struct ScanQ {
     coll: String,
     #[serde(default)]
     after: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    end: Option<String>,
     #[serde(default = "default_scan_limit")]
     limit: usize,
 }
@@ -241,9 +245,10 @@ async fn object(State(s): State<SharedShard>, Query(q): Query<ObjQ>) -> Json<Val
     crate::metrics::inc(&crate::metrics::GET);
     Json(json!({ "object": s.read().unwrap().object(&q.coll, &q.key) }))
 }
-/// Paginated key iteration on this shard (read op). `limit` is capped to keep a page bounded.
+/// Paginated key iteration on this shard with optional prefix/end bounds (read op). `limit` is
+/// capped to keep a page bounded.
 async fn scan(State(s): State<SharedShard>, Query(q): Query<ScanQ>) -> Json<Value> {
-    let keys = s.read().unwrap().scan_keys(&q.coll, q.after.as_deref(), q.limit.min(10_000));
+    let keys = s.read().unwrap().scan_range(&q.coll, q.after.as_deref(), q.prefix.as_deref(), q.end.as_deref(), q.limit.min(10_000));
     Json(json!({ "keys": keys }))
 }
 async fn export(State(s): State<SharedShard>, Json(b): Json<BucketBody>) -> Json<Value> {
@@ -387,10 +392,16 @@ impl ShardClient for HttpShardClient {
         Ok(v.get("object").cloned().filter(|o| !o.is_null()))
     }
 
-    async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> CResult<Vec<String>> {
+    async fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> CResult<Vec<String>> {
         let mut req = self.http.get(format!("{}/scan", self.base)).query(&[("coll", coll), ("limit", &limit.to_string())]);
         if let Some(a) = after {
             req = req.query(&[("after", a)]);
+        }
+        if let Some(p) = prefix {
+            req = req.query(&[("prefix", p)]);
+        }
+        if let Some(e) = end {
+            req = req.query(&[("end", e)]);
         }
         let v: Value = req.send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
         Ok(serde_json::from_value(v.get("keys").cloned().unwrap_or(Value::Null)).unwrap_or_default())
