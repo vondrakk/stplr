@@ -326,6 +326,7 @@ pub async fn serve_addr_full(
     elect: Option<(String, u64)>,
     queue: Option<Arc<crate::ingest::IngestQueue>>,
     auth_token: Option<String>,
+    tls: Option<crate::tls::ServerTls>,
 ) -> std::io::Result<()> {
     let mut router = match elect {
         Some((holder, ttl)) => app_with_leadership(cluster.clone(), spawn_elector(cluster.clone(), holder, ttl)),
@@ -336,8 +337,7 @@ pub async fn serve_addr_full(
         router = add_ingest_routes(router, q);
     }
     let router = crate::net::require_bearer(router, auth_token);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, router).await
+    crate::tls::serve_router(addr, router, tls).await
 }
 
 /// Serve with leader election only (no ingest queue, no auth).
@@ -347,7 +347,7 @@ pub async fn serve_addr_elected(
     holder: String,
     ttl_ms: u64,
 ) -> std::io::Result<()> {
-    serve_addr_full(addr, cluster, Some((holder, ttl_ms)), None, None).await
+    serve_addr_full(addr, cluster, Some((holder, ttl_ms)), None, None, None).await
 }
 
 #[cfg(test)]

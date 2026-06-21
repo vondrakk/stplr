@@ -16,7 +16,7 @@ use std::io;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::net::SharedShard;
@@ -91,32 +91,61 @@ fn as_str(b: &[u8]) -> &str {
 /// Accept loop: one task per connection. Cheap to keep open; clients pool them. When `token` is set,
 /// a connection must authenticate with `OP_AUTH` (matching token) before any other op is served.
 pub async fn serve(listener: TcpListener, state: SharedShard, token: Option<String>) {
+    serve_tls(listener, state, token, None).await
+}
+
+/// Like [`serve`], but when `tls` is set every accepted connection is wrapped in a TLS session
+/// before the (transport-agnostic) handler runs. `set_nodelay` is applied to the raw socket first,
+/// so the latency tuning survives the TLS wrap.
+pub async fn serve_tls(
+    listener: TcpListener,
+    state: SharedShard,
+    token: Option<String>,
+    tls: Option<crate::tls::ServerTls>,
+) {
     // One group-commit writer task for the whole shard; connections send SET writes to it.
     let (wtx, wrx) = mpsc::channel::<WriteReq>(CHAN_CAP);
     tokio::spawn(writer_loop(wrx, state.clone()));
     let token = std::sync::Arc::new(token);
+    let acceptor = tls.map(|t| t.acceptor());
     loop {
         let (sock, _) = match listener.accept().await {
             Ok(x) => x,
             Err(_) => continue,
         };
+        sock.set_nodelay(true).ok(); // latency over throughput-batching for small ops
         let st = state.clone();
         let wtx = wtx.clone();
         let token = token.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            let _ = handle(sock, st, wtx, token).await;
+            match acceptor {
+                Some(acc) => match acc.accept(sock).await {
+                    Ok(stream) => {
+                        let _ = handle(stream, st, wtx, token).await;
+                    }
+                    Err(_) => {} // failed TLS handshake: drop the connection
+                },
+                None => {
+                    let _ = handle(sock, st, wtx, token).await;
+                }
+            }
         });
     }
 }
 
-async fn handle(
-    sock: TcpStream,
+async fn handle<S>(
+    sock: S,
     st: SharedShard,
     wtx: mpsc::Sender<WriteReq>,
     token: std::sync::Arc<Option<String>>,
-) -> io::Result<()> {
-    sock.set_nodelay(true).ok(); // latency over throughput-batching for small ops
-    let (rd, wr) = sock.into_split();
+) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+{
+    // `set_nodelay` is applied to the raw TcpStream in the accept loop (before any TLS wrap), so
+    // this handler is transport-agnostic: a plain TcpStream or a tokio-rustls TlsStream both fit.
+    let (rd, wr) = tokio::io::split(sock);
     let mut r = BufReader::new(rd);
     let mut w = BufWriter::new(wr);
     let mut authed = token.is_none(); // no token configured => open
@@ -216,12 +245,25 @@ pub async fn serve_addr(addr: std::net::SocketAddr, state: SharedShard, token: O
     Ok(())
 }
 
+/// Bind and serve the binary protocol over TLS (when `tls` is `Some`) or plaintext (`None`).
+pub async fn serve_addr_tls(
+    addr: std::net::SocketAddr,
+    state: SharedShard,
+    token: Option<String>,
+    tls: Option<crate::tls::ServerTls>,
+) -> io::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    serve_tls(listener, state, token, tls).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::net::shared;
     use crate::shard::Shard;
     use crate::store::MemoryStore;
+    use tokio::net::TcpStream;
 
     async fn req(stream: &mut TcpStream, frame: &[u8]) -> Vec<u8> {
         stream.write_all(frame).await.unwrap();
@@ -274,6 +316,53 @@ mod tests {
         s.write_all(&miss).await.unwrap();
         s.flush().await.unwrap();
         assert_eq!(s.read_u8().await.unwrap(), ST_ABSENT);
+    }
+
+    #[tokio::test]
+    async fn binary_tls_roundtrip() {
+        crate::tls::init();
+        let dir = std::env::temp_dir().join(format!("stplr-proto-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key, ca) = crate::tls::testutil::self_signed(&dir);
+        let server_tls = crate::tls::ServerTls::from_pem(&cert, &key).unwrap();
+
+        let state: SharedShard = shared(Shard::new("s0", MemoryStore::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { serve_tls(listener, state, None, Some(server_tls)).await });
+
+        // A TLS client that trusts the self-signed cert.
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut std::io::BufReader::new(ca.as_slice())) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let cfg = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg));
+        let name = rustls::pki_types::ServerName::try_from("localhost".to_owned()).unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut s = connector.connect(name, tcp).await.expect("TLS handshake");
+
+        // SET then GET, end to end over the encrypted connection.
+        let mut set = vec![OP_SET];
+        set.extend(field("kv"));
+        set.extend(field("k1"));
+        set.extend(field("\"hi\""));
+        s.write_all(&set).await.unwrap();
+        s.flush().await.unwrap();
+        assert_eq!(s.read_u8().await.unwrap(), ST_OK, "set ok over TLS");
+
+        let mut get = vec![OP_GET];
+        get.extend(field("kv"));
+        get.extend(field("k1"));
+        s.write_all(&get).await.unwrap();
+        s.flush().await.unwrap();
+        assert_eq!(s.read_u8().await.unwrap(), ST_OK, "present over TLS");
+        let n = s.read_u32().await.unwrap() as usize;
+        let mut buf = vec![0u8; n];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(buf, b"\"hi\"", "value round-trips over TLS");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

@@ -64,6 +64,7 @@ impl SmartClient {
                 b = b.default_headers(h);
             }
         }
+        b = crate::tls::client_tls().apply(b); // trust the cluster CA for https shards
         b.build().unwrap_or_else(|_| reqwest::Client::new())
     }
 

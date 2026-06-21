@@ -12,6 +12,19 @@ heed = "0.20"
 toml = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "net", "time", "io-util"] }
 axum = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# rustls-tls-manual-roots pulls the `ring` provider (NOT aws-lc-rs) — client trusts the cluster CA
+# explicitly via ClientTls. Keeps the whole TLS stack on ring, which builds on constrained hosts.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-manual-roots"] }
 async-trait = "0.1"
 anyhow = "1"
+# In-process TLS for BOTH transports. The `ring` crypto provider throughout (small + portable;
+# aws-lc-rs's generated sources are too large for constrained build hosts). axum-server's
+# `tls-rustls-no-provider` gives HTTP TLS without forcing aws-lc-rs; tokio-rustls covers the binary
+# protocol; one rustls ServerConfig drives both.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pemfile = "2"
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
