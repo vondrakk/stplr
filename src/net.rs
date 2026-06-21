@@ -56,6 +56,7 @@ pub trait ShardOps: Send + Sync {
     fn object(&self, coll: &str, key: &str) -> Option<Value>;
     fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>>;
     fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String>;
+    fn scan_buckets(&self, coll: &str, buckets: &[usize], after: Option<&str>, limit: usize) -> Vec<String>;
     fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool;
     fn set_remove(&mut self, coll: &str, key: &str, member: &str) -> bool;
     fn write_object(&mut self, coll: &str, key: &str, obj: Value);
@@ -84,6 +85,9 @@ impl<St: IndexStore + Send + Sync> ShardOps for Shard<St> {
     }
     fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String> {
         Shard::scan_range(self, coll, after, prefix, end, limit)
+    }
+    fn scan_buckets(&self, coll: &str, buckets: &[usize], after: Option<&str>, limit: usize) -> Vec<String> {
+        Shard::scan_buckets(self, coll, buckets, after, limit)
     }
     fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool {
         Shard::set_add(self, coll, key, member)
@@ -167,6 +171,15 @@ struct MgetBody {
     keys: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
+struct ScanBucketsBody {
+    coll: String,
+    buckets: Vec<usize>,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default = "default_scan_limit")]
+    limit: usize,
+}
+#[derive(Serialize, Deserialize)]
 struct SetBody {
     coll: String,
     key: String,
@@ -233,6 +246,7 @@ pub fn app(state: SharedShard) -> Router {
         .route("/object", get(object))
         .route("/mget", post(mget))
         .route("/scan", get(scan))
+        .route("/scanBuckets", post(scan_buckets))
         .route("/setAdd", post(set_add))
         .route("/setRemove", post(set_remove))
         .route("/write", post(write))
@@ -265,6 +279,11 @@ async fn mget(State(s): State<SharedShard>, Json(b): Json<MgetBody>) -> Json<Val
 /// capped to keep a page bounded.
 async fn scan(State(s): State<SharedShard>, Query(q): Query<ScanQ>) -> Json<Value> {
     let keys = s.read().unwrap().scan_range(&q.coll, q.after.as_deref(), q.prefix.as_deref(), q.end.as_deref(), q.limit.min(10_000));
+    Json(json!({ "keys": keys }))
+}
+/// Bucket-filtered key iteration on this shard — the per-shard half of a partition-aware scan.
+async fn scan_buckets(State(s): State<SharedShard>, Json(b): Json<ScanBucketsBody>) -> Json<Value> {
+    let keys = s.read().unwrap().scan_buckets(&b.coll, &b.buckets, b.after.as_deref(), b.limit.min(100_000));
     Json(json!({ "keys": keys }))
 }
 async fn export(State(s): State<SharedShard>, Json(b): Json<BucketBody>) -> Json<Value> {
@@ -406,6 +425,21 @@ impl ShardClient for HttpShardClient {
             .await
             .map_err(|e| e.to_string())?;
         Ok(v.get("object").cloned().filter(|o| !o.is_null()))
+    }
+
+    async fn scan_buckets(&self, coll: &str, buckets: &[usize], after: Option<&str>, limit: usize) -> CResult<Vec<String>> {
+        let body = ScanBucketsBody { coll: coll.into(), buckets: buckets.to_vec(), after: after.map(|s| s.to_string()), limit };
+        let v: Value = self
+            .http
+            .post(format!("{}/scanBuckets", self.base))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::from_value(v.get("keys").cloned().unwrap_or(Value::Null)).unwrap_or_default())
     }
 
     async fn mget(&self, coll: &str, keys: &[String]) -> CResult<Vec<Option<Value>>> {

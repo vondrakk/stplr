@@ -172,6 +172,7 @@ pub fn app(cluster: Co) -> Router {
         .route("/deleteObject", post(delete_object))
         .route("/route", get(route_info))
         .route("/members", get(members))
+        .route("/partitions", get(partitions))
         .with_state(cluster)
 }
 
@@ -241,6 +242,11 @@ async fn members(State(c): State<Co>) -> Json<Value> {
     let members: Vec<Value> =
         c.members_with_endpoints().into_iter().map(|(id, ep)| json!({ "id": id, "endpoint": ep })).collect();
     Json(json!({ "epoch": c.epoch(), "members": members }))
+}
+/// The partition plan for parallel reads: each shard + the buckets it primary-owns. A client reads
+/// each partition directly from its shard's `/scanBuckets`, covering the keyspace once, in parallel.
+async fn partitions(State(c): State<Co>) -> Json<Value> {
+    Json(json!({ "epoch": c.epoch(), "partitions": c.partition_plan() }))
 }
 
 /// Router with a `/leader` status endpoint and leader-gated `/admin/*` driver ops (added on top of
@@ -450,6 +456,42 @@ mod tests {
         // Empty/unknown collection yields an empty drained page.
         let (page, cursor) = cluster.scan_keys("nope", None, 10).await;
         assert!(page.is_empty() && cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn partition_plan_tiles_keyspace_and_reads_are_disjoint() {
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        let mut by_id: HashMap<String, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["s0", "s1", "s2"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            let c: Arc<dyn ShardClient> = Arc::new(HttpShardClient::new(id, &format!("http://{addr}")));
+            clients.insert(id.to_string(), c.clone());
+            by_id.insert(id.to_string(), c);
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+
+        // the plan assigns every bucket exactly once
+        let plan = cluster.partition_plan();
+        let mut buckets: Vec<usize> = plan.iter().flat_map(|p| p.buckets.clone()).collect();
+        let total = buckets.len();
+        buckets.sort();
+        buckets.dedup();
+        assert_eq!(buckets.len(), total, "no bucket assigned to two shards");
+        assert_eq!(buckets.len(), 4096, "every bucket assigned");
+
+        // write keys, then read partition-by-partition straight from each shard
+        let want: std::collections::HashSet<String> = (0..40).map(|i| format!("k{i}")).collect();
+        for k in &want {
+            cluster.put("kv", k, json!(k)).await;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for p in &plan {
+            let c = by_id.get(&p.id).unwrap();
+            for k in c.scan_buckets("kv", &p.buckets, None, 10_000).await.unwrap() {
+                assert!(seen.insert(k), "a key was read on two partitions");
+            }
+        }
+        assert_eq!(seen, want, "every key read exactly once across partitions");
     }
 
     #[tokio::test]

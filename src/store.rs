@@ -66,6 +66,35 @@ pub trait IndexStore {
     fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
         keys.iter().map(|k| self.get_object(coll, k)).collect()
     }
+    /// Ascending keys in this collection whose bucket is in `buckets`, after `after`, up to `limit`.
+    /// Walks the ordered keyspace (reusing `scan_range`) and filters by bucket — the per-shard half
+    /// of a partition-aware parallel scan. `after` is the last key returned (global key order).
+    fn scan_buckets(&self, coll: &str, buckets: &[usize], after: Option<&str>, limit: usize) -> Vec<String> {
+        let want: std::collections::HashSet<usize> = buckets.iter().copied().collect();
+        let mut out = Vec::new();
+        let mut cursor = after.map(|s| s.to_string());
+        const CHUNK: usize = 1024;
+        loop {
+            let page = self.scan_range(coll, cursor.as_deref(), None, None, CHUNK);
+            if page.is_empty() {
+                break;
+            }
+            let full = page.len() == CHUNK;
+            cursor = page.last().cloned();
+            for k in page {
+                if want.contains(&crate::partitioner::bucket_of(&k)) {
+                    out.push(k);
+                    if out.len() >= limit {
+                        return out;
+                    }
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        out
+    }
     fn clear_collection(&mut self, coll: &str);
     fn delete_object(&mut self, coll: &str, id: &str);
 

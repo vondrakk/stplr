@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::client::ShardClient;
@@ -25,6 +26,14 @@ use crate::guard::Gates;
 use crate::journal::{InMemoryJournal, MigrationJournal, MigrationRecord};
 use crate::partitioner::{bucket_of, NodeId, Partitioner};
 use crate::reshard::plan_reshard;
+
+/// One read partition of the keyspace: a shard, its endpoint, and the buckets it primary-owns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Partition {
+    pub id: NodeId,
+    pub endpoint: String,
+    pub buckets: Vec<usize>,
+}
 
 const CHUNK: usize = 256;
 
@@ -267,6 +276,35 @@ impl Cluster {
     /// Cursor-only iteration — `scan_range` with no prefix/end bound.
     pub async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> (Vec<String>, Option<String>) {
         self.scan_range(coll, after, None, None, limit).await
+    }
+
+    /// A read partition: a shard, its endpoint, and the buckets it is the PRIMARY owner of. The
+    /// partitions returned by [`partition_plan`](Self::partition_plan) tile every bucket exactly once,
+    /// so a parallel reader (one task per partition) covers the whole keyspace with no overlap and
+    /// full data locality — each task scans only its own shard, no coordinator/merge in the path.
+    // (struct lives here; see partition_plan below.)
+
+    /// Build the partition plan: assign every bucket to its primary owner and group by shard.
+    pub fn partition_plan(&self) -> Vec<Partition> {
+        let (nbuckets, mut by_node) = {
+            let p = self.partitioner.read().unwrap();
+            let n = p.bucket_count();
+            let mut by: HashMap<NodeId, Vec<usize>> = HashMap::new();
+            for b in 0..n {
+                if let Some(primary) = p.owners_of_bucket(b, 1).into_iter().next() {
+                    by.entry(primary).or_default().push(b);
+                }
+            }
+            (n, by)
+        };
+        let _ = nbuckets;
+        let endpoints: HashMap<NodeId, String> = self.members_with_endpoints().into_iter().collect();
+        let mut plan: Vec<Partition> = by_node
+            .drain()
+            .map(|(id, buckets)| Partition { endpoint: endpoints.get(&id).cloned().unwrap_or_default(), id, buckets })
+            .collect();
+        plan.sort_by(|a, b| a.id.cmp(&b.id));
+        plan
     }
 
     /// Batch get: group the requested keys by their owning shard and issue ONE request per shard
