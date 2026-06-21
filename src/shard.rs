@@ -33,6 +33,9 @@ impl<St: IndexStore> Shard<St> {
     pub fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
         self.store.mget(coll, keys)
     }
+    pub fn scan_buckets(&self, coll: &str, buckets: &[usize], after: Option<&str>, limit: usize) -> Vec<String> {
+        self.store.scan_buckets(coll, buckets, after, limit)
+    }
 
     // --- generic posting-list set ops (cluster-routed) ---
     pub fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool {

@@ -26,6 +26,10 @@ pub trait ShardClient: Send + Sync {
     async fn scan_range(&self, _coll: &str, _after: Option<&str>, _prefix: Option<&str>, _end: Option<&str>, _limit: usize) -> CResult<Vec<String>> {
         Ok(Vec::new())
     }
+    /// Bucket-filtered key scan on this shard (partition-aware reads). Default returns empty.
+    async fn scan_buckets(&self, _coll: &str, _buckets: &[usize], _after: Option<&str>, _limit: usize) -> CResult<Vec<String>> {
+        Ok(Vec::new())
+    }
     /// Batch get on this shard — a value (or None) per key, in order. Default loops `object`.
     async fn mget(&self, coll: &str, keys: &[String]) -> CResult<Vec<Option<Value>>> {
         let mut out = Vec::with_capacity(keys.len());
@@ -93,6 +97,9 @@ impl ShardClient for InProcessShardClient {
     }
     async fn mget(&self, coll: &str, keys: &[String]) -> CResult<Vec<Option<Value>>> {
         Ok(self.shard.read().unwrap().mget(coll, keys))
+    }
+    async fn scan_buckets(&self, coll: &str, buckets: &[usize], after: Option<&str>, limit: usize) -> CResult<Vec<String>> {
+        Ok(self.shard.read().unwrap().scan_buckets(coll, buckets, after, limit))
     }
     async fn set_add(&self, coll: &str, key: &str, member: &str) -> CResult<bool> {
         Ok(self.shard.write().unwrap().set_add(coll, key, member))

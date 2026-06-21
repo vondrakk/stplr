@@ -235,6 +235,38 @@ impl SmartClient {
         self.scan_range(coll, after, None, None, limit).await
     }
 
+    /// The partition plan: each shard + the buckets it primary-owns (tiles the keyspace once).
+    pub fn partitions(&self) -> Vec<crate::cluster::Partition> {
+        let mut by: HashMap<NodeId, Vec<usize>> = HashMap::new();
+        {
+            let p = self.partitioner.read().unwrap();
+            for b in 0..p.bucket_count() {
+                if let Some(primary) = p.owners_of_bucket(b, 1).into_iter().next() {
+                    by.entry(primary).or_default().push(b);
+                }
+            }
+        }
+        let clients = self.clients.read().unwrap();
+        let mut plan: Vec<crate::cluster::Partition> = by
+            .into_iter()
+            .map(|(id, buckets)| {
+                let endpoint = clients.get(&id).map(|c| c.endpoint().to_string()).unwrap_or_default();
+                crate::cluster::Partition { id, endpoint, buckets }
+            })
+            .collect();
+        plan.sort_by(|a, b| a.id.cmp(&b.id));
+        plan
+    }
+
+    /// Read one partition directly from its shard — bucket-filtered, paginated by `after`. Run these
+    /// concurrently (one task per partition) for a parallel, locality-aware, exactly-once full scan.
+    pub async fn scan_partition(&self, partition: &crate::cluster::Partition, coll: &str, after: Option<&str>, limit: usize) -> Vec<String> {
+        match self.client_of(&partition.id) {
+            Some(c) => c.scan_buckets(coll, &partition.buckets, after, limit).await.unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+
     /// Batch get: group keys by owning shard, one direct request per shard, reassembled in order.
     pub async fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
         let mut by_node: HashMap<NodeId, Vec<usize>> = HashMap::new();
