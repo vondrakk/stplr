@@ -269,6 +269,29 @@ impl Cluster {
         self.scan_range(coll, after, None, None, limit).await
     }
 
+    /// Batch get: group the requested keys by their owning shard and issue ONE request per shard
+    /// (instead of one per key), then reassemble into input order. Missing/failed keys come back as
+    /// `None`. The round-trip-amortization win for clients reading many keys (e.g. a compute partition).
+    pub async fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
+        let mut by_node: HashMap<NodeId, Vec<usize>> = HashMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            if let Some(owner) = self.owners(k).into_iter().find(|n| !self.is_down(n)) {
+                by_node.entry(owner).or_default().push(i);
+            }
+        }
+        let mut out = vec![None; keys.len()];
+        for (node, idxs) in by_node {
+            let Some(c) = self.client_of(&node) else { continue };
+            let sub: Vec<String> = idxs.iter().map(|&i| keys[i].clone()).collect();
+            if let Ok(vals) = c.mget(coll, &sub).await {
+                for (j, &i) in idxs.iter().enumerate() {
+                    out[i] = vals.get(j).cloned().flatten();
+                }
+            }
+        }
+        out
+    }
+
     pub async fn get(&self, coll: &str, key: &str) -> Option<Value> {
         let _gate = self.gates.enter(bucket_of(key)).await;
         for node in self.owners(key) {

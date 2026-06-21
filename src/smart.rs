@@ -235,6 +235,27 @@ impl SmartClient {
         self.scan_range(coll, after, None, None, limit).await
     }
 
+    /// Batch get: group keys by owning shard, one direct request per shard, reassembled in order.
+    pub async fn mget(&self, coll: &str, keys: &[String]) -> Vec<Option<Value>> {
+        let mut by_node: HashMap<NodeId, Vec<usize>> = HashMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            if let Some(owner) = self.owners(k).into_iter().next() {
+                by_node.entry(owner).or_default().push(i);
+            }
+        }
+        let mut out = vec![None; keys.len()];
+        for (node, idxs) in by_node {
+            let Some(c) = self.client_of(&node) else { continue };
+            let sub: Vec<String> = idxs.iter().map(|&i| keys[i].clone()).collect();
+            if let Ok(vals) = c.mget(coll, &sub).await {
+                for (j, &i) in idxs.iter().enumerate() {
+                    out[i] = vals.get(j).cloned().flatten();
+                }
+            }
+        }
+        out
+    }
+
     /// Write to every replica of `key`.
     pub async fn put(&self, coll: &str, key: &str, obj: Value) {
         for node in self.owners(key) {

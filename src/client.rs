@@ -26,6 +26,14 @@ pub trait ShardClient: Send + Sync {
     async fn scan_range(&self, _coll: &str, _after: Option<&str>, _prefix: Option<&str>, _end: Option<&str>, _limit: usize) -> CResult<Vec<String>> {
         Ok(Vec::new())
     }
+    /// Batch get on this shard — a value (or None) per key, in order. Default loops `object`.
+    async fn mget(&self, coll: &str, keys: &[String]) -> CResult<Vec<Option<Value>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(self.object(coll, k).await?);
+        }
+        Ok(out)
+    }
     async fn set_add(&self, coll: &str, key: &str, member: &str) -> CResult<bool>;
     async fn set_remove(&self, coll: &str, key: &str, member: &str) -> CResult<bool>;
     async fn write_object(&self, coll: &str, key: &str, obj: Value) -> CResult<()>;
@@ -82,6 +90,9 @@ impl ShardClient for InProcessShardClient {
     }
     async fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> CResult<Vec<String>> {
         Ok(self.shard.read().unwrap().scan_range(coll, after, prefix, end, limit))
+    }
+    async fn mget(&self, coll: &str, keys: &[String]) -> CResult<Vec<Option<Value>>> {
+        Ok(self.shard.read().unwrap().mget(coll, keys))
     }
     async fn set_add(&self, coll: &str, key: &str, member: &str) -> CResult<bool> {
         Ok(self.shard.write().unwrap().set_add(coll, key, member))
