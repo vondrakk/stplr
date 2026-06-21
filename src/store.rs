@@ -43,6 +43,17 @@ pub trait IndexStore {
     fn scan_objects(&self, coll: &str) -> Vec<Value>;
     /// (id, obj) pairs — needed for resharding, where the routing key (= id) must be known.
     fn scan_entries(&self, coll: &str) -> Vec<(String, Value)>;
+    /// Paginated, ascending key iteration within a collection: keys strictly greater than `after`
+    /// (`None` = from the start), up to `limit`, skipping expired keys. The default collects + sorts
+    /// via `scan_entries`; durable stores override with an LMDB cursor range scan (no full load).
+    fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> Vec<String> {
+        let mut keys: Vec<String> = self.scan_entries(coll).into_iter().map(|(k, _)| k).collect();
+        keys.sort();
+        match after {
+            Some(a) => keys.into_iter().filter(|k| k.as_str() > a).take(limit).collect(),
+            None => keys.into_iter().take(limit).collect(),
+        }
+    }
     fn clear_collection(&mut self, coll: &str);
     fn delete_object(&mut self, coll: &str, id: &str);
 

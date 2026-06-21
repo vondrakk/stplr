@@ -100,6 +100,17 @@ struct ObjQ {
     key: String,
 }
 #[derive(Deserialize)]
+struct ScanQ {
+    coll: String,
+    #[serde(default)]
+    after: Option<String>,
+    #[serde(default = "default_scan_limit")]
+    limit: usize,
+}
+fn default_scan_limit() -> usize {
+    1000
+}
+#[derive(Deserialize)]
 struct WriteBody {
     coll: String,
     key: String,
@@ -142,6 +153,7 @@ pub fn app(cluster: Co) -> Router {
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
         .route("/metrics", get(metrics))
         .route("/object", get(object))
+        .route("/scan", get(scan))
         .route("/write", post(write))
         .route("/cas", post(cas))
         .route("/incr", post(incr))
@@ -167,6 +179,12 @@ async fn metrics(State(c): State<Co>) -> String {
 async fn object(State(c): State<Co>, Query(q): Query<ObjQ>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::GET);
     Json(json!({ "object": c.get(&q.coll, &q.key).await }))
+}
+/// Cluster-wide paginated key iteration: fan out to all shards, merge into one ascending page +
+/// a `cursor` to pass back as `?after=` for the next page (null when the collection is drained).
+async fn scan(State(c): State<Co>, Query(q): Query<ScanQ>) -> Json<Value> {
+    let (keys, cursor) = c.scan_keys(&q.coll, q.after.as_deref(), q.limit.min(10_000)).await;
+    Json(json!({ "keys": keys, "cursor": cursor }))
 }
 async fn write(State(c): State<Co>, Json(b): Json<WriteBody>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::SET);
@@ -380,6 +398,42 @@ mod tests {
         let mut m = cluster.member_ids();
         m.sort();
         assert_eq!(m, vec!["s0".to_string(), "s1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn scan_iterates_all_keys_across_shards_paginated() {
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["s0", "s1"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            clients.insert(id.to_string(), Arc::new(HttpShardClient::new(id, &format!("http://{addr}"))));
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+
+        // 25 keys scatter across the two shards by rendezvous hashing.
+        let mut want: Vec<String> = (0..25).map(|i| format!("k{i:02}")).collect();
+        want.sort();
+        for k in &want {
+            cluster.put("kv", k, json!(k)).await;
+        }
+
+        // Page through with a small limit; the cursor walks the whole collection in ascending order.
+        let mut got: Vec<String> = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let (page, cursor) = cluster.scan_keys("kv", after.as_deref(), 10).await;
+            got.extend(page.clone());
+            // each page is globally sorted and strictly after the previous cursor
+            assert!(page.windows(2).all(|w| w[0] < w[1]), "page ascending");
+            match cursor {
+                Some(c) => after = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(got, want, "scan returns every key exactly once, in order");
+
+        // Empty/unknown collection yields an empty drained page.
+        let (page, cursor) = cluster.scan_keys("nope", None, 10).await;
+        assert!(page.is_empty() && cursor.is_none());
     }
 
     // Two coordinators over the SAME shards (same node ids → same lease arbiter shard). Exercises

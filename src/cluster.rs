@@ -237,6 +237,26 @@ impl Cluster {
 
     /// Read an object from a live owner of `key`, gated against an in-flight migration of its
     /// bucket and failing over to the next replica.
+    /// Iterate keys in `coll` across ALL shards. Each live shard returns its keys strictly greater
+    /// than `after` (ascending); results are merged + de-duplicated (a key lives on R replicas) into
+    /// one ascending page of at most `limit`. Returns `(page, next_cursor)` where `next_cursor` is
+    /// the last key when a full page came back (pass it as the next `after`), else `None` (drained).
+    pub async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> (Vec<String>, Option<String>) {
+        let clients: Vec<Arc<dyn ShardClient>> = self.clients.read().unwrap().values().cloned().collect();
+        let mut merged = std::collections::BTreeSet::new();
+        for c in clients {
+            if self.is_down(c.id()) {
+                continue;
+            }
+            if let Ok(keys) = c.scan_keys(coll, after, limit).await {
+                merged.extend(keys);
+            }
+        }
+        let page: Vec<String> = merged.into_iter().take(limit).collect();
+        let cursor = if page.len() >= limit { page.last().cloned() } else { None };
+        (page, cursor)
+    }
+
     pub async fn get(&self, coll: &str, key: &str) -> Option<Value> {
         let _gate = self.gates.enter(bucket_of(key)).await;
         for node in self.owners(key) {
