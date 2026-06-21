@@ -21,9 +21,9 @@ pub type CResult<T> = Result<T, String>;
 pub trait ShardClient: Send + Sync {
     fn id(&self) -> &str;
     async fn object(&self, coll: &str, key: &str) -> CResult<Option<Value>>;
-    /// Paginated key iteration on this shard. Default returns empty (backends that can't enumerate);
-    /// shard-backed clients override it.
-    async fn scan_keys(&self, _coll: &str, _after: Option<&str>, _limit: usize) -> CResult<Vec<String>> {
+    /// Key iteration on this shard with optional cursor/prefix/end bounds. Default returns empty
+    /// (backends that can't enumerate); shard-backed clients override it.
+    async fn scan_range(&self, _coll: &str, _after: Option<&str>, _prefix: Option<&str>, _end: Option<&str>, _limit: usize) -> CResult<Vec<String>> {
         Ok(Vec::new())
     }
     async fn set_add(&self, coll: &str, key: &str, member: &str) -> CResult<bool>;
@@ -80,8 +80,8 @@ impl ShardClient for InProcessShardClient {
     async fn object(&self, coll: &str, key: &str) -> CResult<Option<Value>> {
         Ok(self.shard.read().unwrap().object(coll, key))
     }
-    async fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> CResult<Vec<String>> {
-        Ok(self.shard.read().unwrap().scan_keys(coll, after, limit))
+    async fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> CResult<Vec<String>> {
+        Ok(self.shard.read().unwrap().scan_range(coll, after, prefix, end, limit))
     }
     async fn set_add(&self, coll: &str, key: &str, member: &str) -> CResult<bool> {
         Ok(self.shard.write().unwrap().set_add(coll, key, member))

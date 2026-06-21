@@ -286,9 +286,10 @@ impl IndexStore for LmdbStore {
         }
     }
 
-    /// Cursor range scan: seek past `after` and walk forward up to `limit` keys (LMDB stores keys
-    /// sorted, so this never loads the whole collection — the win over the trait default).
-    fn scan_keys(&self, coll: &str, after: Option<&str>, limit: usize) -> Vec<String> {
+    /// Cursor range scan: seek to the lower bound and walk forward, stopping at `end`/`prefix` or
+    /// `limit`. LMDB stores keys sorted, so this never loads the whole collection and breaks early
+    /// once it passes the requested range — the win over the trait default.
+    fn scan_range(&self, coll: &str, after: Option<&str>, prefix: Option<&str>, end: Option<&str>, limit: usize) -> Vec<String> {
         use std::ops::Bound;
         let Some(db) = self.read_db(&Self::obj_db(coll)) else {
             return Vec::new();
@@ -297,9 +298,13 @@ impl IndexStore for LmdbStore {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let lower = match after {
-            Some(a) => Bound::Excluded(a),
-            None => Bound::Unbounded,
+        // Lower bound = the tighter of the cursor (exclusive) and the prefix start (inclusive).
+        let lower = match (after, prefix) {
+            (Some(a), Some(p)) if a >= p => Bound::Excluded(a),
+            (Some(_), Some(p)) => Bound::Included(p),
+            (Some(a), None) => Bound::Excluded(a),
+            (None, Some(p)) => Bound::Included(p),
+            (None, None) => Bound::Unbounded,
         };
         let range: (Bound<&str>, Bound<&str>) = (lower, Bound::Unbounded);
         let iter = match db.range(&rtxn, &range) {
@@ -312,12 +317,17 @@ impl IndexStore for LmdbStore {
             if out.len() >= limit {
                 break;
             }
-            if let Ok((k, _)) = item {
-                if check_ttl && self.is_expired(coll, k) {
-                    continue;
-                }
-                out.push(k.to_string());
+            let Ok((k, _)) = item else { continue };
+            if end.is_some_and(|e| k >= e) {
+                break; // sorted: past the end bound, done
             }
+            if prefix.is_some_and(|p| !k.starts_with(p)) {
+                break; // sorted: past the prefix range, done
+            }
+            if check_ttl && self.is_expired(coll, k) {
+                continue;
+            }
+            out.push(k.to_string());
         }
         out
     }
