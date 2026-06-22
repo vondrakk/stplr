@@ -47,6 +47,16 @@ pub trait ChangeLog: Send + Sync {
             0
         }
     }
+    /// A consumer group's committed read offset (0 = never committed; the group starts at the beginning).
+    fn committed_offset(&self, group: &str) -> u64;
+    /// Persist a consumer group's committed offset — acks every event up to and including `seq`, so the
+    /// next [`read_group`](Self::read_group) resumes after it. Durable for the LMDB log.
+    fn commit_offset(&self, group: &str, seq: u64);
+    /// The next batch for a consumer group: events after its committed offset, up to `limit`. Lets
+    /// many independent consumers share one feed, each tracking its own position (at-least-once).
+    fn read_group(&self, group: &str, limit: usize) -> Vec<ChangeEvent> {
+        self.read(self.committed_offset(group), limit)
+    }
 }
 
 /// 20-digit zero-padded key so lexical order == numeric order for range scans.
@@ -60,6 +70,7 @@ fn key(seq: u64) -> String {
 pub struct MemoryChangeLog {
     inner: Mutex<Vec<ChangeEvent>>,
     next: AtomicU64,
+    offsets: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl MemoryChangeLog {
@@ -93,6 +104,12 @@ impl ChangeLog for MemoryChangeLog {
         v.retain(|e| e.seq >= before);
         n - v.len()
     }
+    fn committed_offset(&self, group: &str) -> u64 {
+        self.offsets.lock().unwrap().get(group).copied().unwrap_or(0)
+    }
+    fn commit_offset(&self, group: &str, seq: u64) {
+        self.offsets.lock().unwrap().insert(group.to_string(), seq);
+    }
 }
 
 /// Durable log on LMDB (one db, seq -> JSON event). Recovers its counter from the last key on
@@ -100,6 +117,7 @@ impl ChangeLog for MemoryChangeLog {
 pub struct LmdbChangeLog {
     env: Env,
     db: Database<Str, Str>,
+    offsets: Database<Str, Str>, // consumer-group committed offsets: group -> seq
     next: Mutex<u64>,
 }
 
@@ -107,19 +125,20 @@ impl LmdbChangeLog {
     pub fn open(path: &Path, map_size: usize) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         // SAFETY: single-process open; the mmap is not aliased elsewhere.
-        let env = unsafe { EnvOpenOptions::new().max_dbs(2).map_size(map_size).open(path)? };
-        let db: Database<Str, Str> = {
+        let env = unsafe { EnvOpenOptions::new().max_dbs(4).map_size(map_size).open(path)? };
+        let (db, offsets): (Database<Str, Str>, Database<Str, Str>) = {
             let mut wtxn = env.write_txn()?;
             let db = env.create_database(&mut wtxn, Some("changefeed"))?;
+            let offsets = env.create_database(&mut wtxn, Some("offsets"))?;
             wtxn.commit()?;
-            db
+            (db, offsets)
         };
         let next = {
             let rtxn = env.read_txn()?;
             let last = db.last(&rtxn)?.and_then(|(k, _)| k.parse::<u64>().ok()).unwrap_or(0);
             last + 1
         };
-        Ok(Self { env, db, next: Mutex::new(next) })
+        Ok(Self { env, db, offsets, next: Mutex::new(next) })
     }
 }
 
@@ -205,6 +224,19 @@ impl ChangeLog for LmdbChangeLog {
         }
         removed
     }
+    fn committed_offset(&self, group: &str) -> u64 {
+        let Ok(rtxn) = self.env.read_txn() else {
+            return 0;
+        };
+        self.offsets.get(&rtxn, group).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+    fn commit_offset(&self, group: &str, seq: u64) {
+        if let Ok(mut wtxn) = self.env.write_txn() {
+            if self.offsets.put(&mut wtxn, group, &seq.to_string()).is_ok() {
+                let _ = wtxn.commit();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +297,47 @@ mod tests {
             let log = LmdbChangeLog::open(&dir, 16 * 1024 * 1024).unwrap();
             exercise_retention(&log);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn exercise_groups(log: &dyn ChangeLog) {
+        for i in 0..5 {
+            log.append("add", &format!("v{i}"), "s", "d"); // seq 1..=5
+        }
+        // a fresh group starts from the beginning
+        assert_eq!(log.committed_offset("g1"), 0);
+        let first = log.read_group("g1", 2);
+        assert_eq!(first.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+
+        // commit advances g1; g2 is independent (still sees everything)
+        log.commit_offset("g1", 2);
+        assert_eq!(log.read_group("g1", 10).iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        assert_eq!(log.read_group("g2", 10).len(), 5);
+
+        // drain g1
+        log.commit_offset("g1", 5);
+        assert!(log.read_group("g1", 10).is_empty());
+        assert_eq!(log.committed_offset("g1"), 5);
+        assert_eq!(log.committed_offset("g2"), 0);
+    }
+
+    #[test]
+    fn memory_consumer_groups() {
+        exercise_groups(&MemoryChangeLog::new());
+    }
+
+    #[test]
+    fn lmdb_consumer_groups_durable() {
+        let dir = std::env::temp_dir().join(format!("stplr-cf-grp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let log = LmdbChangeLog::open(&dir, 16 * 1024 * 1024).unwrap();
+            exercise_groups(&log);
+        }
+        // reopen: the committed offset survived the restart
+        let log = LmdbChangeLog::open(&dir, 16 * 1024 * 1024).unwrap();
+        assert_eq!(log.committed_offset("g1"), 5, "offset recovered from disk");
+        assert!(log.read_group("g1", 10).is_empty(), "g1 still drained after restart");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
