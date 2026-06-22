@@ -24,6 +24,9 @@ use anyhow::{bail, Result};
 pub enum Op {
     Read,
     Write,
+    /// Destructive removal (deleteObject, dropBuckets) — a separately grantable privilege so an app
+    /// can be given read+write without the ability to delete. An `admin` grant implies it.
+    Delete,
     Admin,
 }
 
@@ -34,6 +37,7 @@ pub struct Grant {
     pub coll: String,
     pub read: bool,
     pub write: bool,
+    pub delete: bool,
     pub admin: bool,
 }
 
@@ -44,10 +48,12 @@ impl Grant {
             (_, Some(c)) => self.coll == c,
             (_, None) => false,          // a non-wildcard grant can't authorize a cluster-level op
         };
+        // admin implies every op on the granted scope; the others are granted individually.
         coll_ok
             && match op {
-                Op::Read => self.read,
-                Op::Write => self.write,
+                Op::Read => self.read || self.admin,
+                Op::Write => self.write || self.admin,
+                Op::Delete => self.delete || self.admin,
                 Op::Admin => self.admin,
             }
     }
@@ -85,13 +91,14 @@ impl Policy {
             if token.is_empty() || coll.is_empty() {
                 bail!("bad policy entry '{entry}': empty token or coll");
             }
-            let mut grant = Grant { coll: coll.to_string(), read: false, write: false, admin: false };
+            let mut grant = Grant { coll: coll.to_string(), read: false, write: false, delete: false, admin: false };
             for ch in perms.chars() {
                 match ch {
                     'r' => grant.read = true,
                     'w' => grant.write = true,
+                    'd' => grant.delete = true,
                     'a' => grant.admin = true,
-                    other => bail!("bad permission '{other}' in '{entry}' (want r/w/a)"),
+                    other => bail!("bad permission '{other}' in '{entry}' (want r/w/d/a)"),
                 }
             }
             let p = tokens.entry(token.to_string()).or_insert_with(|| Principal { name: token.to_string(), grants: vec![] });
@@ -141,6 +148,18 @@ mod tests {
         assert!(svc.allows(Some("kv"), Op::Write));
         assert!(svc.allows(Some("logs"), Op::Read));
         assert!(!svc.allows(Some("logs"), Op::Write), "logs is read-only for svc");
+    }
+
+    #[test]
+    fn delete_is_a_separate_privilege() {
+        let p = Policy::parse("app:kv:rw; ops:kv:rwd; root:*:a").unwrap();
+        let app = p.principal("app").unwrap();
+        assert!(app.allows(Some("kv"), Op::Write));
+        assert!(!app.allows(Some("kv"), Op::Delete), "read+write must NOT imply delete");
+        assert!(p.principal("ops").unwrap().allows(Some("kv"), Op::Delete), "explicit 'd' grants delete");
+        // admin implies every op
+        let root = p.principal("root").unwrap();
+        assert!(root.allows(Some("kv"), Op::Delete) && root.allows(Some("kv"), Op::Write) && root.allows(None, Op::Admin));
     }
 
     #[test]

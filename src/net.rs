@@ -97,6 +97,7 @@ fn op_of(path: &str) -> crate::rbac::Op {
     match path {
         "/object" | "/scan" | "/mget" | "/scanBuckets" | "/export" | "/caps" | "/members"
         | "/partitions" | "/route" | "/leader" | "/ingest/status" => Op::Read,
+        "/deleteObject" | "/dropBuckets" => Op::Delete,
         _ => Op::Write,
     }
 }
@@ -767,5 +768,9 @@ mod tests {
         // ...but is scoped to kv: reading another collection is forbidden
         let r = http.get(format!("{base}/object?coll=other&key=k")).bearer_auth("rw").send().await.unwrap();
         assert_eq!(status(r), 403, "rw scoped to kv, not 'other'");
+
+        // per-op granularity: rw has write but NOT delete -> deleteObject forbidden
+        let d = http.post(format!("{base}/deleteObject")).bearer_auth("rw").json(&json!({"coll":"kv","key":"k"})).send().await.unwrap();
+        assert_eq!(status(d), 403, "write grant does not include delete");
     }
 }
