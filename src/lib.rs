@@ -29,6 +29,7 @@ pub mod lmdb;
 pub mod metrics;
 pub mod net;
 pub mod partitioner;
+pub mod pitr;
 pub mod proto;
 pub mod rbac;
 pub mod reshard;
