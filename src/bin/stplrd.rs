@@ -28,6 +28,9 @@ struct Args {
     bind: String,
     bin_bind: Option<String>,
     resp_bind: Option<String>,
+    // PITR: record mutations to a write-ahead log at this dir; restore mode replays it.
+    pitr_log: Option<PathBuf>,
+    pitr_restore_to: Option<u64>,
     store: String,
     path: PathBuf,
     map_size: usize,
@@ -73,6 +76,8 @@ fn print_help() {
          \x20 --bind <ADDR>       HTTP listen address (default 0.0.0.0:8100)\n\
          \x20 --bin-bind <ADDR>   binary-protocol listen address (shard only; e.g. 0.0.0.0:8101)\n\
          \x20 --resp-bind <ADDR>  Redis-compatible (RESP) listen address (shard only; e.g. 0.0.0.0:6379)\n\
+         \x20 --pitr-log <DIR>    record all mutations to a PITR write-ahead log at DIR        [shard]\n\
+         \x20 --pitr-restore-to <MS>  rebuild --path store from --pitr-log as of epoch-ms MS, then exit\n\
          \x20 --store <KIND>      memory | lmdb (default memory)            [shard]\n\
          \x20 --path <DIR>        lmdb data directory (default ./stplr-data) [shard]\n\
          \x20 --map-size <SIZE>   lmdb map ceiling, e.g. 512mb, 8gb          [shard]\n\
@@ -119,6 +124,8 @@ fn parse_args() -> Args {
         bind: "0.0.0.0:8100".into(),
         bin_bind: None,
         resp_bind: None,
+        pitr_log: None,
+        pitr_restore_to: None,
         store: "memory".into(),
         path: PathBuf::from("./stplr-data"),
         map_size: 2 * 1024 * 1024 * 1024,
@@ -148,6 +155,8 @@ fn parse_args() -> Args {
             "--bind" => a.bind = it.next().unwrap_or(a.bind),
             "--bin-bind" => a.bin_bind = it.next(),
             "--resp-bind" => a.resp_bind = it.next(),
+            "--pitr-log" => a.pitr_log = it.next().map(PathBuf::from),
+            "--pitr-restore-to" => a.pitr_restore_to = it.next().and_then(|s| s.parse().ok()),
             "--store" => a.store = it.next().unwrap_or(a.store),
             "--path" => a.path = it.next().map(PathBuf::from).unwrap_or(a.path),
             "--map-size" => a.map_size = it.next().as_deref().and_then(parse_size).unwrap_or(a.map_size),
@@ -275,6 +284,17 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // PITR restore mode: rebuild the --path lmdb store from the --pitr-log WAL as of a timestamp, then
+    // exit. Run before serving so an operator restores into a fresh data dir offline.
+    if let Some(target) = args.pitr_restore_to {
+        let dir = args.pitr_log.as_ref().ok_or_else(|| anyhow::anyhow!("--pitr-restore-to needs --pitr-log <DIR>"))?;
+        let wal = stplr::pitr::LmdbWal::open(dir, args.map_size)?;
+        let mut store = LmdbStore::open(&args.path, args.map_size)?;
+        let n = stplr::pitr::restore_into(&wal, target, &mut store);
+        eprintln!("PITR: replayed {n} op(s) from {} into {} as of epoch-ms {target}", dir.display(), args.path.display());
+        return Ok(());
+    }
+
     if args.role == "coordinator" {
         return run_coordinator(&args).await;
     }
@@ -282,11 +302,31 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("unknown --role '{}' (expected shard | coordinator)", args.role);
     }
 
+    // Optional PITR write-ahead log: when set, the shard records every mutation to it.
+    let wal: Option<Arc<dyn stplr::pitr::Wal>> = match &args.pitr_log {
+        Some(dir) => Some(Arc::new(stplr::pitr::LmdbWal::open(dir, args.map_size)?)),
+        None => None,
+    };
     let state: SharedShard = match args.store.as_str() {
-        "memory" => shared(Shard::new(&args.id, MemoryStore::new())),
-        "lmdb" => shared(Shard::new(&args.id, LmdbStore::open(&args.path, args.map_size)?)),
+        "memory" => {
+            let mut s = Shard::new(&args.id, MemoryStore::new());
+            if let Some(w) = &wal {
+                s = s.with_wal(w.clone());
+            }
+            shared(s)
+        }
+        "lmdb" => {
+            let mut s = Shard::new(&args.id, LmdbStore::open(&args.path, args.map_size)?);
+            if let Some(w) = &wal {
+                s = s.with_wal(w.clone());
+            }
+            shared(s)
+        }
         other => anyhow::bail!("unknown store '{other}' (expected memory | lmdb)"),
     };
+    if wal.is_some() {
+        eprintln!("stplrd '{}' recording PITR log at {}", args.id, args.pitr_log.as_ref().unwrap().display());
+    }
 
     // Background TTL sweeper: reclaim expired keys periodically (cheap no-op when no TTLs are set).
     {
