@@ -48,6 +48,15 @@ pub trait Wal: Send + Sync {
     fn entries(&self) -> Vec<WalEntry>;
     /// Drop records with `ts_ms < before` (PITR-window retention). Returns how many were removed.
     fn compact_before(&self, before: u64) -> usize;
+    /// Records with `seq > after`, in order — for resumable tailing (e.g. geo-replication). The
+    /// default filters `entries`; durable backends may override with a range scan.
+    fn entries_after(&self, after: u64) -> Vec<WalEntry> {
+        self.entries().into_iter().filter(|e| e.seq > after).collect()
+    }
+    /// A named cursor's committed seq (0 if never set) — lets a consumer resume where it left off.
+    fn read_cursor(&self, name: &str) -> u64;
+    /// Persist a named cursor's committed seq.
+    fn commit_cursor(&self, name: &str, seq: u64);
 }
 
 /// Apply one op to a store (used during replay).
@@ -87,6 +96,7 @@ fn key(seq: u64) -> String {
 #[derive(Default)]
 pub struct MemoryWal {
     inner: Mutex<Vec<WalEntry>>,
+    cursors: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl MemoryWal {
@@ -111,12 +121,19 @@ impl Wal for MemoryWal {
         v.retain(|e| e.ts_ms >= before);
         n - v.len()
     }
+    fn read_cursor(&self, name: &str) -> u64 {
+        self.cursors.lock().unwrap().get(name).copied().unwrap_or(0)
+    }
+    fn commit_cursor(&self, name: &str, seq: u64) {
+        self.cursors.lock().unwrap().insert(name.to_string(), seq);
+    }
 }
 
 /// Durable WAL on LMDB (one db, seq -> JSON record). Recovers its counter from the last key on open.
 pub struct LmdbWal {
     env: Env,
     db: Database<Str, Str>,
+    cursors: Database<Str, Str>, // consumer cursors: name -> committed seq
     next: Mutex<u64>,
 }
 
@@ -124,18 +141,19 @@ impl LmdbWal {
     pub fn open(path: &Path, map_size: usize) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         // SAFETY: single-process open; the mmap is not aliased elsewhere.
-        let env = unsafe { EnvOpenOptions::new().max_dbs(2).map_size(map_size).open(path)? };
-        let db: Database<Str, Str> = {
+        let env = unsafe { EnvOpenOptions::new().max_dbs(4).map_size(map_size).open(path)? };
+        let (db, cursors): (Database<Str, Str>, Database<Str, Str>) = {
             let mut wtxn = env.write_txn()?;
             let db = env.create_database(&mut wtxn, Some("wal"))?;
+            let cursors = env.create_database(&mut wtxn, Some("cursors"))?;
             wtxn.commit()?;
-            db
+            (db, cursors)
         };
         let next = {
             let rtxn = env.read_txn()?;
             db.last(&rtxn)?.and_then(|(k, _)| k.parse::<u64>().ok()).unwrap_or(0) + 1
         };
-        Ok(Self { env, db, next: Mutex::new(next) })
+        Ok(Self { env, db, cursors, next: Mutex::new(next) })
     }
 }
 
@@ -194,6 +212,19 @@ impl Wal for LmdbWal {
             return 0;
         }
         removed
+    }
+    fn read_cursor(&self, name: &str) -> u64 {
+        let Ok(rtxn) = self.env.read_txn() else {
+            return 0;
+        };
+        self.cursors.get(&rtxn, name).ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(0)
+    }
+    fn commit_cursor(&self, name: &str, seq: u64) {
+        if let Ok(mut wtxn) = self.env.write_txn() {
+            if self.cursors.put(&mut wtxn, name, &seq.to_string()).is_ok() {
+                let _ = wtxn.commit();
+            }
+        }
     }
 }
 

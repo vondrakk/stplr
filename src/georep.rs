@@ -131,6 +131,62 @@ pub fn tail(log: &dyn ChangeLog, group: &str, limit: usize, ts_ms: u64, origin: 
     Some(ReplBatch { origin: origin.to_string(), last_seq, entries: from_change_events(&events, ts_ms) })
 }
 
+/// Convert PITR write-ahead-log entries into replicated ops (the comprehensive mutation source for
+/// active-passive geo-replication — the WAL captures every mutation, not just set ops). A `PutTtl`
+/// replicates as a plain `Put` (the destination applies it as a live value).
+pub fn from_wal_entries(entries: &[crate::pitr::WalEntry]) -> Vec<ReplEntry> {
+    use crate::pitr::WalOp;
+    entries
+        .iter()
+        .map(|e| {
+            let op = match &e.op {
+                WalOp::Put { coll, key, value } => ReplOp::Put { coll: coll.clone(), key: key.clone(), value: value.clone() },
+                WalOp::PutTtl { coll, key, value, .. } => ReplOp::Put { coll: coll.clone(), key: key.clone(), value: value.clone() },
+                WalOp::Delete { coll, key } => ReplOp::Delete { coll: coll.clone(), key: key.clone() },
+                WalOp::SetAdd { coll, key, member } => ReplOp::SetAdd { coll: coll.clone(), key: key.clone(), member: member.clone() },
+                WalOp::SetRemove { coll, key, member } => ReplOp::SetRemove { coll: coll.clone(), key: key.clone(), member: member.clone() },
+            };
+            ReplEntry { ts_ms: e.ts_ms, op }
+        })
+        .collect()
+}
+
+/// One replication cycle: tail the WAL past `group`'s cursor, ship the batch to `peer`, and (only on
+/// success) advance the cursor so the next cycle resumes after it. Returns the number of ops shipped.
+pub async fn replicate_once(
+    wal: &dyn crate::pitr::Wal,
+    client: &reqwest::Client,
+    peer: &str,
+    origin: &str,
+    group: &str,
+) -> Result<usize, String> {
+    let cursor = wal.read_cursor(group);
+    let entries = wal.entries_after(cursor);
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let last_seq = entries.last().map(|e| e.seq).unwrap_or(cursor);
+    let batch = ReplBatch { origin: origin.to_string(), last_seq, entries: from_wal_entries(&entries) };
+    let n = batch.entries.len();
+    ship_batch(client, peer, &batch).await?;
+    wal.commit_cursor(group, last_seq);
+    Ok(n)
+}
+
+/// Active-passive replicator: forever, tail this node's PITR WAL and ship new mutations to the
+/// passive `peer` cluster's `/geo/apply`. Resumable via the durable WAL cursor (named `group`).
+pub async fn replicate_loop(wal: std::sync::Arc<dyn crate::pitr::Wal>, peer: String, origin: String, group: String, interval_ms: u64) {
+    let client = reqwest::Client::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms.max(50))).await;
+        match replicate_once(wal.as_ref(), &client, &peer, &origin, &group).await {
+            Ok(n) if n > 0 => eprintln!("geo: replicated {n} op(s) to {peer}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("geo: replication to {peer} failed: {e}"),
+        }
+    }
+}
+
 /// Ship a batch to a peer's geo-apply endpoint (`POST {peer}/geo/apply`). Returns Ok on a 2xx.
 pub async fn ship_batch(client: &reqwest::Client, peer: &str, batch: &ReplBatch) -> Result<(), String> {
     let resp = client
@@ -226,5 +282,53 @@ mod tests {
         apply_lww(&mut remote, &b);
         // ACME was added then removed; EU remains
         assert_eq!(remote.set_members("orders", "d1"), vec!["EU".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn replicate_from_wal_to_peer_endpoint() {
+        use crate::client::ShardClient;
+        use crate::cluster::Cluster;
+        use crate::net::{serve_ephemeral, shared, HttpShardClient};
+        use crate::partitioner::NodeId;
+        use crate::pitr::{MemoryWal, Wal};
+        use crate::shard::Shard;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        // Active source: a shard recording its mutations to a PITR WAL.
+        let wal = Arc::new(MemoryWal::new());
+        let mut src = Shard::new("src", MemoryStore::new()).with_wal(wal.clone());
+        src.write_object("kv", "a", Value::from("v1"));
+        src.set_add("tags", "d1", "x");
+        src.write_object("kv", "a", Value::from("v2"));
+
+        // Passive destination cluster, with the coordinator /geo/apply endpoint.
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["d0", "d1"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            clients.insert(id.to_string(), Arc::new(HttpShardClient::new(id, &format!("http://{addr}"))));
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = listener.local_addr().unwrap();
+        let router = crate::coord::app(cluster.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let peer = format!("http://{caddr}");
+
+        // One replication cycle ships the whole WAL and advances the cursor.
+        let client = reqwest::Client::new();
+        let n = replicate_once(wal.as_ref(), &client, &peer, "src", "geo->dst").await.unwrap();
+        assert_eq!(n, 3, "shipped all 3 recorded mutations");
+        assert_eq!(wal.read_cursor("geo->dst"), 3, "cursor advanced to the WAL head");
+
+        // The destination now holds the replicated state (latest value + the set member).
+        assert_eq!(cluster.get("kv", "a").await, Some(Value::from("v2")));
+        let tags = cluster.get("tags", "d1").await.unwrap();
+        assert!(tags.as_array().unwrap().iter().any(|v| v == "x"), "set member replicated");
+
+        // Caught up: a second cycle ships nothing.
+        assert_eq!(replicate_once(wal.as_ref(), &client, &peer, "src", "geo->dst").await.unwrap(), 0);
     }
 }
