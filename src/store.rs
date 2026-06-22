@@ -130,7 +130,9 @@ pub trait IndexStore {
     fn incr(&mut self, coll: &str, key: &str, delta: i64) -> Option<i64> {
         let cur = match self.get_object(coll, key) {
             None => 0,
-            Some(v) => v.as_i64()?,
+            // Accept a JSON number OR a numeric string (Redis stores integers as strings, so this
+            // keeps INCR working under the RESP protocol as well as the JSON API).
+            Some(v) => v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))?,
         };
         let next = cur.wrapping_add(delta);
         self.put_object(coll, key, Value::from(next));

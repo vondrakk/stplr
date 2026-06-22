@@ -32,6 +32,7 @@ pub mod partitioner;
 pub mod proto;
 pub mod rbac;
 pub mod reshard;
+pub mod resp;
 pub mod shard;
 pub mod smart;
 pub mod store;

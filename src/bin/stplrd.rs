@@ -27,6 +27,7 @@ struct Args {
     role: String,
     bind: String,
     bin_bind: Option<String>,
+    resp_bind: Option<String>,
     store: String,
     path: PathBuf,
     map_size: usize,
@@ -71,6 +72,7 @@ fn print_help() {
          \x20 --role <ROLE>       shard | coordinator (default shard)\n\
          \x20 --bind <ADDR>       HTTP listen address (default 0.0.0.0:8100)\n\
          \x20 --bin-bind <ADDR>   binary-protocol listen address (shard only; e.g. 0.0.0.0:8101)\n\
+         \x20 --resp-bind <ADDR>  Redis-compatible (RESP) listen address (shard only; e.g. 0.0.0.0:6379)\n\
          \x20 --store <KIND>      memory | lmdb (default memory)            [shard]\n\
          \x20 --path <DIR>        lmdb data directory (default ./stplr-data) [shard]\n\
          \x20 --map-size <SIZE>   lmdb map ceiling, e.g. 512mb, 8gb          [shard]\n\
@@ -116,6 +118,7 @@ fn parse_args() -> Args {
         role: "shard".into(),
         bind: "0.0.0.0:8100".into(),
         bin_bind: None,
+        resp_bind: None,
         store: "memory".into(),
         path: PathBuf::from("./stplr-data"),
         map_size: 2 * 1024 * 1024 * 1024,
@@ -144,6 +147,7 @@ fn parse_args() -> Args {
             "--role" => a.role = it.next().unwrap_or(a.role),
             "--bind" => a.bind = it.next().unwrap_or(a.bind),
             "--bin-bind" => a.bin_bind = it.next(),
+            "--resp-bind" => a.resp_bind = it.next(),
             "--store" => a.store = it.next().unwrap_or(a.store),
             "--path" => a.path = it.next().map(PathBuf::from).unwrap_or(a.path),
             "--map-size" => a.map_size = it.next().as_deref().and_then(parse_size).unwrap_or(a.map_size),
@@ -310,6 +314,17 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("stplrd '{}' binary protocol on {}{}", args.id, baddr, if btls.is_some() { " (TLS)" } else { "" });
         tokio::spawn(async move {
             let _ = stplr::proto::serve_addr_tls(baddr, bstate, btoken, btls).await;
+        });
+    }
+
+    // Optional Redis-compatible (RESP) protocol, sharing the same shard state.
+    if let Some(r) = &args.resp_bind {
+        let raddr: SocketAddr = r.parse().map_err(|e| anyhow::anyhow!("bad --resp-bind '{r}': {e}"))?;
+        let rstate = state.clone();
+        let rtoken = args.auth_token.clone();
+        eprintln!("stplrd '{}' RESP (Redis-compatible) on {}", args.id, raddr);
+        tokio::spawn(async move {
+            let _ = stplr::resp::serve_addr(raddr, rstate, rtoken).await;
         });
     }
 
