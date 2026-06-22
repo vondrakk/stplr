@@ -47,6 +47,86 @@ async fn bearer_layer(State(token): State<Arc<String>>, req: Request, next: Next
     }
 }
 
+/// Like [`require_bearer`], but enforces a full RBAC [`Policy`](crate::rbac::Policy): the request is
+/// authenticated, classified into an op + target collection, and authorized against the token's
+/// grants. `/health` + `/metrics` stay open. 401 = unknown/missing token; 403 = authenticated but
+/// not permitted.
+pub fn require_policy(router: Router, policy: Arc<crate::rbac::Policy>) -> Router {
+    router.layer(middleware::from_fn_with_state(policy, policy_layer))
+}
+
+async fn policy_layer(
+    State(policy): State<Arc<crate::rbac::Policy>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let path = req.uri().path().to_string();
+    if path == "/health" || path == "/metrics" {
+        return Ok(next.run(req).await);
+    }
+    let token = match req.headers().get(AUTHORIZATION).and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")) {
+        Some(t) => t.to_string(),
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
+    let op = op_of(&path);
+    let query_coll = req.uri().query().and_then(coll_from_query);
+    // POSTs carry the target collection in {"coll":...}; buffer the body to read it, then rebuild
+    // the request so the handler still receives the body intact.
+    let (req, coll) = if query_coll.is_none() && req.method() == axum::http::Method::POST {
+        let (parts, body) = req.into_parts();
+        let bytes = axum::body::to_bytes(body, 1 << 20).await.unwrap_or_default();
+        let c = coll_from_body(&bytes);
+        (Request::from_parts(parts, axum::body::Body::from(bytes)), c)
+    } else {
+        (req, query_coll)
+    };
+    match policy.principal(&token) {
+        Some(p) if p.allows(coll.as_deref(), op) => Ok(next.run(req).await),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Classify a request path into the access it needs — by route, not HTTP method (several POST routes
+/// are reads: mget, scanBuckets, export).
+fn op_of(path: &str) -> crate::rbac::Op {
+    use crate::rbac::Op;
+    if path.starts_with("/admin") {
+        return Op::Admin;
+    }
+    match path {
+        "/object" | "/scan" | "/mget" | "/scanBuckets" | "/export" | "/caps" | "/members"
+        | "/partitions" | "/route" | "/leader" | "/ingest/status" => Op::Read,
+        _ => Op::Write,
+    }
+}
+
+fn coll_from_query(q: &str) -> Option<String> {
+    q.split('&').find_map(|p| p.strip_prefix("coll=")).map(percent_decode)
+}
+
+fn coll_from_body(bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(bytes).ok()?.get("coll")?.as_str().map(str::to_string)
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Object-safe view of a shard's operations, so the HTTP server is not generic over the store.
 /// Generic store + set-membership + reshard only — no correlation types cross this boundary.
 /// `Sync` so the server can hold it behind an `RwLock`: read ops (`object`/`export`/`caps`) take a
@@ -655,5 +735,37 @@ mod tests {
         let c = HttpShardClient::new_authed("s0", &base, Some("sekret"));
         c.write_object(MAP, "k", json!("v")).await.unwrap();
         assert_eq!(c.object(MAP, "k").await.unwrap(), Some(json!("v")));
+    }
+
+    #[tokio::test]
+    async fn http_rbac_policy() {
+        let shard: SharedShard = Arc::new(RwLock::new(Shard::new("s0", MemoryStore::new())));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // rw: read+write on kv only; ro: read-only on everything
+        let policy = Arc::new(crate::rbac::Policy::parse("rw:kv:rw;ro:*:r").unwrap());
+        let router = require_policy(app(shard), policy);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let status = |r: reqwest::Response| r.status().as_u16();
+
+        // unknown token -> 401; /health open
+        assert_eq!(status(http.get(format!("{base}/object?coll=kv&key=k")).bearer_auth("nope").send().await.unwrap()), 401);
+        assert_eq!(status(http.get(format!("{base}/health")).send().await.unwrap()), 200);
+
+        // ro: may read kv, may NOT write it (403)
+        assert_eq!(status(http.get(format!("{base}/object?coll=kv&key=k")).bearer_auth("ro").send().await.unwrap()), 200);
+        let w = http.post(format!("{base}/write")).bearer_auth("ro").json(&json!({"coll":"kv","key":"k","obj":"v"})).send().await.unwrap();
+        assert_eq!(status(w), 403, "read-only token can't write");
+
+        // rw: may write kv...
+        let w = http.post(format!("{base}/write")).bearer_auth("rw").json(&json!({"coll":"kv","key":"k","obj":"v"})).send().await.unwrap();
+        assert_eq!(status(w), 200, "rw writes kv");
+        // ...but is scoped to kv: reading another collection is forbidden
+        let r = http.get(format!("{base}/object?coll=other&key=k")).bearer_auth("rw").send().await.unwrap();
+        assert_eq!(status(r), 403, "rw scoped to kv, not 'other'");
     }
 }
