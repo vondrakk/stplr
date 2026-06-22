@@ -50,6 +50,8 @@ struct Args {
     tls_key: Option<String>,
     tls_ca: Option<String>,
     tls_insecure: bool,
+    // RBAC policy spec ("token:coll:perms;..."); when set it replaces the single --auth-token.
+    policy: Option<String>,
 }
 
 /// Build the server TLS materials from `--tls-cert`/`--tls-key` (None when neither is set).
@@ -84,6 +86,7 @@ fn print_help() {
          \x20 --lease-ttl-ms <N>  leader lease TTL in ms (default 10000)     [coordinator]\n\
          \x20 --ingest-queue <DIR>  durable write-ahead ingest queue at DIR  [coordinator]\n\
          \x20 --auth-token <TOK>  require Bearer <TOK> on the API (or env STPLR_AUTH_TOKEN)\n\
+         \x20 --policy <SPEC>     RBAC: 'token:coll:perms;...' (perms r/w/a, coll or *); replaces --auth-token\n\
          \x20 --tls-cert <FILE>   PEM cert chain — enables TLS on the binary + HTTP transports (with --tls-key)\n\
          \x20 --tls-key <FILE>    PEM private key for --tls-cert\n\
          \x20 --tls-ca <FILE>     PEM CA to trust for coordinator->shard https (client side)\n\
@@ -133,6 +136,7 @@ fn parse_args() -> Args {
         tls_key: None,
         tls_ca: None,
         tls_insecure: false,
+        policy: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -160,6 +164,7 @@ fn parse_args() -> Args {
             "--tls-key" => a.tls_key = it.next(),
             "--tls-ca" => a.tls_ca = it.next(),
             "--tls-insecure" => a.tls_insecure = true,
+            "--policy" => a.policy = it.next(),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -236,7 +241,11 @@ async fn run_coordinator(args: &Args) -> anyhow::Result<()> {
             None => String::new(),
         }
     );
-    stplr::coord::serve_addr_full(addr, cluster, elect, queue, args.auth_token.clone(), server_tls).await?;
+    let policy = match &args.policy {
+        Some(spec) => Some(std::sync::Arc::new(stplr::rbac::Policy::parse(spec)?)),
+        None => None,
+    };
+    stplr::coord::serve_addr_full(addr, cluster, elect, queue, args.auth_token.clone(), server_tls, policy).await?;
     Ok(())
 }
 
@@ -314,6 +323,10 @@ async fn main() -> anyhow::Result<()> {
         if args.store == "lmdb" { format!(", path={}", args.path.display()) } else { String::new() },
         if args.auth_token.is_some() { ", bearer-auth" } else { "" }
     );
-    stplr::tls::serve_router(addr, stplr::net::require_bearer(app(state), args.auth_token), server_tls).await?;
+    let router = match &args.policy {
+        Some(spec) => stplr::net::require_policy(app(state), std::sync::Arc::new(stplr::rbac::Policy::parse(spec)?)),
+        None => stplr::net::require_bearer(app(state), args.auth_token),
+    };
+    stplr::tls::serve_router(addr, router, server_tls).await?;
     Ok(())
 }

@@ -367,6 +367,7 @@ pub async fn serve_addr_full(
     queue: Option<Arc<crate::ingest::IngestQueue>>,
     auth_token: Option<String>,
     tls: Option<crate::tls::ServerTls>,
+    policy: Option<Arc<crate::rbac::Policy>>,
 ) -> std::io::Result<()> {
     let mut router = match elect {
         Some((holder, ttl)) => app_with_leadership(cluster.clone(), spawn_elector(cluster.clone(), holder, ttl)),
@@ -376,7 +377,11 @@ pub async fn serve_addr_full(
         crate::ingest::spawn_drainer(q.clone(), cluster.clone() as Arc<dyn crate::ingest::WriteSink>, 50);
         router = add_ingest_routes(router, q);
     }
-    let router = crate::net::require_bearer(router, auth_token);
+    // RBAC policy takes precedence over the single bearer token when configured.
+    let router = match policy {
+        Some(p) => crate::net::require_policy(router, p),
+        None => crate::net::require_bearer(router, auth_token),
+    };
     crate::tls::serve_router(addr, router, tls).await
 }
 
@@ -387,7 +392,7 @@ pub async fn serve_addr_elected(
     holder: String,
     ttl_ms: u64,
 ) -> std::io::Result<()> {
-    serve_addr_full(addr, cluster, Some((holder, ttl_ms)), None, None, None).await
+    serve_addr_full(addr, cluster, Some((holder, ttl_ms)), None, None, None, None).await
 }
 
 #[cfg(test)]
