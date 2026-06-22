@@ -173,6 +173,7 @@ pub fn app(cluster: Co) -> Router {
         .route("/route", get(route_info))
         .route("/members", get(members))
         .route("/partitions", get(partitions))
+        .route("/geo/apply", post(geo_apply))
         .with_state(cluster)
 }
 
@@ -247,6 +248,43 @@ async fn members(State(c): State<Co>) -> Json<Value> {
 /// each partition directly from its shard's `/scanBuckets`, covering the keyspace once, in parallel.
 async fn partitions(State(c): State<Co>) -> Json<Value> {
     Json(json!({ "epoch": c.epoch(), "partitions": c.partition_plan() }))
+}
+/// Geo-replication sink: apply a batch shipped from a peer cluster, with last-writer-wins for KV
+/// (a per-key sidecar timestamp) and additive merge for set ops.
+async fn geo_apply(State(c): State<Co>, Json(b): Json<crate::georep::ReplBatch>) -> Json<Value> {
+    use crate::georep::{ReplOp, GEO_TS};
+    let mut applied = 0usize;
+    for e in &b.entries {
+        match &e.op {
+            ReplOp::Put { coll, key, value } => {
+                let tk = format!("{coll}\u{1}{key}");
+                let last = c.get(GEO_TS, &tk).await.and_then(|v| v.as_u64()).unwrap_or(0);
+                if e.ts_ms >= last {
+                    c.put(coll, key, value.clone()).await;
+                    c.put(GEO_TS, &tk, json!(e.ts_ms)).await;
+                    applied += 1;
+                }
+            }
+            ReplOp::Delete { coll, key } => {
+                let tk = format!("{coll}\u{1}{key}");
+                let last = c.get(GEO_TS, &tk).await.and_then(|v| v.as_u64()).unwrap_or(0);
+                if e.ts_ms >= last {
+                    c.delete(coll, key).await;
+                    c.put(GEO_TS, &tk, json!(e.ts_ms)).await;
+                    applied += 1;
+                }
+            }
+            ReplOp::SetAdd { coll, key, member } => {
+                c.set_add(coll, key, member).await;
+                applied += 1;
+            }
+            ReplOp::SetRemove { coll, key, member } => {
+                c.set_remove(coll, key, member).await;
+                applied += 1;
+            }
+        }
+    }
+    Json(json!({ "applied": applied, "origin": b.origin }))
 }
 
 /// Router with a `/leader` status endpoint and leader-gated `/admin/*` driver ops (added on top of
@@ -519,6 +557,38 @@ mod tests {
         );
         // empty request -> empty result
         assert!(cluster.mget("kv", &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn geo_apply_endpoint_applies_with_lww() {
+        use crate::georep::{ReplBatch, ReplEntry, ReplOp};
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["s0", "s1"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            clients.insert(id.to_string(), Arc::new(HttpShardClient::new(id, &format!("http://{addr}"))));
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let caddr = listener.local_addr().unwrap();
+        let router = app(cluster.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let http = reqwest::Client::new();
+        let base = format!("http://{caddr}");
+        let batch = |key: &str, v: &str, ts: u64| ReplBatch {
+            origin: "dc1".into(),
+            last_seq: ts,
+            entries: vec![ReplEntry { ts_ms: ts, op: ReplOp::Put { coll: "kv".into(), key: key.into(), value: json!(v) } }],
+        };
+
+        // ship a write, then an OLDER one for the same key — LWW must keep the newer
+        http.post(format!("{base}/geo/apply")).json(&batch("a", "v2", 200)).send().await.unwrap();
+        http.post(format!("{base}/geo/apply")).json(&batch("a", "v1", 100)).send().await.unwrap();
+        assert_eq!(cluster.get("kv", "a").await, Some(json!("v2")), "older geo write dropped (LWW)");
+        // a newer write wins
+        http.post(format!("{base}/geo/apply")).json(&batch("a", "v3", 300)).send().await.unwrap();
+        assert_eq!(cluster.get("kv", "a").await, Some(json!("v3")));
     }
 
     #[tokio::test]
