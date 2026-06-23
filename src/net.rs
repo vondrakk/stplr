@@ -141,6 +141,7 @@ pub trait ShardOps: Send + Sync {
     fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool;
     fn set_remove(&mut self, coll: &str, key: &str, member: &str) -> bool;
     fn write_object(&mut self, coll: &str, key: &str, obj: Value);
+    fn apply_repl_op(&mut self, op: &crate::georep::ReplOp, origin: &str);
     fn write_object_ttl(&mut self, coll: &str, key: &str, obj: Value, ttl_ms: u64);
     fn sweep_expired(&mut self) -> usize;
     fn cas(&mut self, coll: &str, key: &str, expect: Option<Value>, new: Value) -> bool;
@@ -178,6 +179,9 @@ impl<St: IndexStore + Send + Sync> ShardOps for Shard<St> {
     }
     fn write_object(&mut self, coll: &str, key: &str, obj: Value) {
         Shard::write_object(self, coll, key, obj)
+    }
+    fn apply_repl_op(&mut self, op: &crate::georep::ReplOp, origin: &str) {
+        Shard::apply_repl_op(self, op, origin)
     }
     fn write_object_ttl(&mut self, coll: &str, key: &str, obj: Value, ttl_ms: u64) {
         Shard::write_object_ttl(self, coll, key, obj, ttl_ms)
@@ -261,6 +265,11 @@ struct ScanBucketsBody {
     limit: usize,
 }
 #[derive(Serialize, Deserialize)]
+struct ApplyReplBody {
+    op: crate::georep::ReplOp,
+    origin: String,
+}
+#[derive(Serialize, Deserialize)]
 struct SetBody {
     coll: String,
     key: String,
@@ -331,6 +340,7 @@ pub fn app(state: SharedShard) -> Router {
         .route("/setAdd", post(set_add))
         .route("/setRemove", post(set_remove))
         .route("/write", post(write))
+        .route("/applyRepl", post(apply_repl))
         .route("/cas", post(cas))
         .route("/incr", post(incr))
         .route("/deleteObject", post(delete_object))
@@ -400,6 +410,11 @@ async fn write(State(s): State<SharedShard>, Json(b): Json<WriteBody>) -> Json<V
         Some(ttl) if ttl > 0 => s.write().unwrap().write_object_ttl(&b.coll, &b.key, b.obj, ttl),
         _ => s.write().unwrap().write_object(&b.coll, &b.key, b.obj),
     }
+    Json(json!({ "ok": true }))
+}
+/// Apply a geo-replicated op, recording it in the WAL tagged with its source DC (active-active).
+async fn apply_repl(State(s): State<SharedShard>, Json(b): Json<ApplyReplBody>) -> Json<Value> {
+    s.write().unwrap().apply_repl_op(&b.op, &b.origin);
     Json(json!({ "ok": true }))
 }
 async fn cas(State(s): State<SharedShard>, Json(b): Json<CasBody>) -> Json<Value> {
@@ -551,6 +566,12 @@ impl ShardClient for HttpShardClient {
         }
         let v: Value = req.send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string())?;
         Ok(serde_json::from_value(v.get("keys").cloned().unwrap_or(Value::Null)).unwrap_or_default())
+    }
+
+    async fn apply_repl_op(&self, op: &crate::georep::ReplOp, origin: &str) -> CResult<()> {
+        let body = ApplyReplBody { op: op.clone(), origin: origin.to_string() };
+        self.http.post(format!("{}/applyRepl", self.base)).json(&body).send().await.map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     async fn set_add(&self, coll: &str, key: &str, member: &str) -> CResult<bool> {
