@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use stplr::client::ShardClient;
 use stplr::cluster::Cluster;
+use stplr::compress::CompressedStore;
 use stplr::lmdb::LmdbStore;
 use stplr::net::{app, shared, HttpShardClient, SharedShard};
 use stplr::partitioner::NodeId;
@@ -53,6 +54,9 @@ struct Args {
     tls_insecure: bool,
     // RBAC policy spec ("token:coll:perms;..."); when set it replaces the single --auth-token.
     policy: Option<String>,
+    // Block compression: lz4-compress stored values larger than compress_min bytes.
+    compress: bool,
+    compress_min: usize,
 }
 
 /// Build the server TLS materials from `--tls-cert`/`--tls-key` (None when neither is set).
@@ -88,6 +92,8 @@ fn print_help() {
          \x20 --lease-ttl-ms <N>  leader lease TTL in ms (default 10000)     [coordinator]\n\
          \x20 --ingest-queue <DIR>  durable write-ahead ingest queue at DIR  [coordinator]\n\
          \x20 --auth-token <TOK>  require Bearer <TOK> on the API (or env STPLR_AUTH_TOKEN)\n\
+         \x20 --compress          lz4-compress stored values over --compress-min bytes      [shard]\n\
+         \x20 --compress-min <SZ>  min value size to compress (default 256)                  [shard]\n\
          \x20 --policy <SPEC>     RBAC: 'token:coll:perms;...' (perms r/w/a, coll or *); replaces --auth-token\n\
          \x20 --tls-cert <FILE>   PEM cert chain — enables TLS on the binary + HTTP transports (with --tls-key)\n\
          \x20 --tls-key <FILE>    PEM private key for --tls-cert\n\
@@ -140,6 +146,8 @@ fn parse_args() -> Args {
         tls_ca: None,
         tls_insecure: false,
         policy: None,
+        compress: false,
+        compress_min: 256,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -159,6 +167,8 @@ fn parse_args() -> Args {
             "--lease-ttl-ms" => a.lease_ttl_ms = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.lease_ttl_ms),
             "--ingest-queue" => a.ingest_queue = it.next().map(PathBuf::from),
             "--auth-token" => a.auth_token = it.next(),
+            "--compress" => a.compress = true,
+            "--compress-min" => a.compress_min = it.next().as_deref().and_then(parse_size).unwrap_or(a.compress_min),
             "--replication" => a.replication = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.replication),
             "--shard-count" => a.shard_count = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.shard_count),
             "--shard-name" => a.shard_name = it.next(),
@@ -282,11 +292,17 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("unknown --role '{}' (expected shard | coordinator)", args.role);
     }
 
-    let state: SharedShard = match args.store.as_str() {
-        "memory" => shared(Shard::new(&args.id, MemoryStore::new())),
-        "lmdb" => shared(Shard::new(&args.id, LmdbStore::open(&args.path, args.map_size)?)),
-        other => anyhow::bail!("unknown store '{other}' (expected memory | lmdb)"),
+    let cmin = args.compress_min;
+    let state: SharedShard = match (args.store.as_str(), args.compress) {
+        ("memory", false) => shared(Shard::new(&args.id, MemoryStore::new())),
+        ("memory", true) => shared(Shard::new(&args.id, CompressedStore::new(MemoryStore::new(), cmin))),
+        ("lmdb", false) => shared(Shard::new(&args.id, LmdbStore::open(&args.path, args.map_size)?)),
+        ("lmdb", true) => shared(Shard::new(&args.id, CompressedStore::new(LmdbStore::open(&args.path, args.map_size)?, cmin))),
+        (other, _) => anyhow::bail!("unknown store '{other}' (expected memory | lmdb)"),
     };
+    if args.compress {
+        eprintln!("stplrd '{}' compressing values over {cmin} bytes (lz4)", args.id);
+    }
 
     // Background TTL sweeper: reclaim expired keys periodically (cheap no-op when no TTLs are set).
     {
