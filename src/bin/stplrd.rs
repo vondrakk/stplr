@@ -53,6 +53,9 @@ struct Args {
     tls_insecure: bool,
     // RBAC policy spec ("token:coll:perms;..."); when set it replaces the single --auth-token.
     policy: Option<String>,
+    // Dedicated mutual-TLS listener (client certs required) + the CA that signs valid client certs.
+    mtls_bind: Option<String>,
+    mtls_client_ca: Option<String>,
 }
 
 /// Build the server TLS materials from `--tls-cert`/`--tls-key` (None when neither is set).
@@ -93,6 +96,8 @@ fn print_help() {
          \x20 --tls-key <FILE>    PEM private key for --tls-cert\n\
          \x20 --tls-ca <FILE>     PEM CA to trust for coordinator->shard https (client side)\n\
          \x20 --tls-insecure      skip cert verification on client connections (DEV ONLY)\n\
+         \x20 --mtls-bind <ADDR>  dedicated mutual-TLS listener for the client API (needs --tls-cert/-key) [shard]\n\
+         \x20 --mtls-client-ca <FILE>  PEM CA that signs the client certs accepted on --mtls-bind\n\
          \x20 --verify-snapshot <FILE>  inspect a backup snapshot (read-only) and exit\n\
          \x20 -h, --help         this help"
     );
@@ -140,6 +145,8 @@ fn parse_args() -> Args {
         tls_ca: None,
         tls_insecure: false,
         policy: None,
+        mtls_bind: None,
+        mtls_client_ca: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -168,6 +175,8 @@ fn parse_args() -> Args {
             "--tls-key" => a.tls_key = it.next(),
             "--tls-ca" => a.tls_ca = it.next(),
             "--tls-insecure" => a.tls_insecure = true,
+            "--mtls-bind" => a.mtls_bind = it.next(),
+            "--mtls-client-ca" => a.mtls_client_ca = it.next(),
             "--policy" => a.policy = it.next(),
             "-h" | "--help" => {
                 print_help();
@@ -338,8 +347,30 @@ async fn main() -> anyhow::Result<()> {
         if args.store == "lmdb" { format!(", path={}", args.path.display()) } else { String::new() },
         if args.auth_token.is_some() { ", bearer-auth" } else { "" }
     );
-    let router = match &args.policy {
-        Some(spec) => stplr::net::require_policy(app(state), std::sync::Arc::new(stplr::rbac::Policy::parse(spec)?)),
+    let policy_arc = match &args.policy {
+        Some(spec) => Some(std::sync::Arc::new(stplr::rbac::Policy::parse(spec)?)),
+        None => None,
+    };
+    // Optional dedicated mutual-TLS listener for the external client API (client certs required).
+    // Internal coordinator->shard traffic is unaffected — it uses the plain server-TLS config.
+    if let Some(mb) = &args.mtls_bind {
+        let maddr: SocketAddr = mb.parse().map_err(|e| anyhow::anyhow!("bad --mtls-bind '{mb}': {e}"))?;
+        let (c, k, ca) = match (&args.tls_cert, &args.tls_key, &args.mtls_client_ca) {
+            (Some(c), Some(k), Some(ca)) => (c.clone(), k.clone(), ca.clone()),
+            _ => anyhow::bail!("--mtls-bind needs --tls-cert, --tls-key, and --mtls-client-ca"),
+        };
+        let mtls = stplr::tls::ServerTls::from_pem_mtls(&c, &k, &ca)?;
+        let mrouter = match &policy_arc {
+            Some(p) => stplr::net::require_policy(app(state.clone()), p.clone()),
+            None => stplr::net::require_bearer(app(state.clone()), args.auth_token.clone()),
+        };
+        eprintln!("stplrd '{}' mutual-TLS (client-cert) listener on {maddr}", args.id);
+        tokio::spawn(async move {
+            let _ = stplr::tls::serve_router(maddr, mrouter, Some(mtls)).await;
+        });
+    }
+    let router = match &policy_arc {
+        Some(p) => stplr::net::require_policy(app(state), p.clone()),
         None => stplr::net::require_bearer(app(state), args.auth_token),
     };
     stplr::tls::serve_router(addr, router, server_tls).await?;

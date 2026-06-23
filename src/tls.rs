@@ -42,6 +42,28 @@ impl ServerTls {
         Ok(ServerTls { config: Arc::new(config) })
     }
 
+    /// Like [`from_pem`](Self::from_pem) but **requires a client certificate** signed by the CA in
+    /// `client_ca_path` (mutual TLS). Used for a dedicated client-facing listener; the handshake is
+    /// rejected if the client presents no cert or one not chaining to that CA. Internal
+    /// coordinator→shard traffic keeps using the plain server-TLS config, so it's unaffected.
+    pub fn from_pem_mtls(cert_path: &str, key_path: &str, client_ca_path: &str) -> Result<ServerTls> {
+        init();
+        let certs = load_certs(cert_path)?;
+        let key = load_key(key_path)?;
+        let mut roots = rustls::RootCertStore::empty();
+        for c in load_certs(client_ca_path)? {
+            roots.add(c).context("adding client CA cert")?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .context("building client-certificate verifier")?;
+        let config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .context("building mTLS server config")?;
+        Ok(ServerTls { config: Arc::new(config) })
+    }
+
     /// Acceptor that wraps each accepted raw TCP connection in a TLS session (binary protocol).
     pub fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
         tokio_rustls::TlsAcceptor::from(self.config.clone())
@@ -138,11 +160,71 @@ pub(crate) mod testutil {
         std::fs::write(&key_path, &key_pem).unwrap();
         (cert_path.to_string_lossy().into(), key_path.to_string_lossy().into(), cert_pem.into_bytes())
     }
+
+    /// Like [`self_signed`] but with BOTH serverAuth + clientAuth EKUs, so the one cert can act as the
+    /// server cert, the client CA, and a client identity in an mTLS test. Returns
+    /// `(cert_path, key_path, cert_pem, key_pem)`.
+    pub fn self_signed_dual(dir: &std::path::Path) -> (String, String, String, String) {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+        params.extended_key_usages =
+            vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth, rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key.serialize_pem();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("k.pem");
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        (cert_path.to_string_lossy().into(), key_path.to_string_lossy().into(), cert_pem, key_pem)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn mtls_accepts_valid_client_cert_rejects_none() {
+        use crate::net::{app, shared};
+        use crate::shard::Shard;
+        use crate::store::MemoryStore;
+        let dir = std::env::temp_dir().join(format!("stplr-mtls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert, key, cert_pem, key_pem) = testutil::self_signed_dual(&dir);
+        // server cert = cert; client CA = the same self-signed cert (so it trusts a client presenting it)
+        let mtls = ServerTls::from_pem_mtls(&cert, &key, &cert).unwrap();
+
+        let state = shared(Shard::new("s0", MemoryStore::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = mtls.axum_config();
+        let router = app(state);
+        tokio::spawn(async move {
+            let _ = axum_server::from_tcp_rustls(listener, cfg).serve(router.into_make_service()).await;
+        });
+
+        let server_ca = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+        let url = format!("https://127.0.0.1:{}/health", addr.port());
+
+        // a client presenting a valid cert is accepted
+        let id = reqwest::Identity::from_pem(format!("{cert_pem}{key_pem}").as_bytes()).unwrap();
+        let with = reqwest::Client::builder().add_root_certificate(server_ca.clone()).identity(id).build().unwrap();
+        let mut ok = false;
+        for _ in 0..30 {
+            if let Ok(r) = with.get(&url).send().await {
+                ok = r.status().is_success();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ok, "valid client cert accepted over mTLS");
+
+        // a client presenting NO cert is rejected at the handshake (server is confirmed up above)
+        let without = reqwest::Client::builder().add_root_certificate(server_ca).build().unwrap();
+        assert!(without.get(&url).send().await.is_err(), "no client cert -> rejected by mTLS");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn loads_pem_into_server_config() {
