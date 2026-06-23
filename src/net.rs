@@ -146,6 +146,7 @@ pub trait ShardOps: Send + Sync {
     fn cas(&mut self, coll: &str, key: &str, expect: Option<Value>, new: Value) -> bool;
     fn incr(&mut self, coll: &str, key: &str, delta: i64) -> Option<i64>;
     fn write_batch(&mut self, items: Vec<(String, String, Value)>);
+    fn apply_txn(&mut self, txn: &crate::txn::Txn) -> bool;
     fn delete_object(&mut self, coll: &str, key: &str);
     fn export_entries(&self, coll: &str, buckets: &[usize]) -> Vec<(String, Value)>;
     fn import_entries(&mut self, coll: &str, entries: Vec<(String, Value)>);
@@ -193,6 +194,9 @@ impl<St: IndexStore + Send + Sync> ShardOps for Shard<St> {
     }
     fn write_batch(&mut self, items: Vec<(String, String, Value)>) {
         Shard::write_batch(self, items)
+    }
+    fn apply_txn(&mut self, txn: &crate::txn::Txn) -> bool {
+        Shard::apply_txn(self, txn)
     }
     fn delete_object(&mut self, coll: &str, key: &str) {
         Shard::delete_object(self, coll, key)
@@ -333,6 +337,7 @@ pub fn app(state: SharedShard) -> Router {
         .route("/write", post(write))
         .route("/cas", post(cas))
         .route("/incr", post(incr))
+        .route("/txn", post(txn))
         .route("/deleteObject", post(delete_object))
         .route("/export", post(export))
         .route("/import", post(import))
@@ -411,6 +416,12 @@ async fn incr(State(s): State<SharedShard>, Json(b): Json<IncrBody>) -> Json<Val
     crate::metrics::inc(&crate::metrics::SET);
     let value = s.write().unwrap().incr(&b.coll, &b.key, b.delta);
     Json(json!({ "value": value }))
+}
+/// Apply a single-shard transaction (all-or-nothing under the shard's write lock).
+async fn txn(State(s): State<SharedShard>, Json(t): Json<crate::txn::Txn>) -> Json<Value> {
+    crate::metrics::inc(&crate::metrics::SET);
+    let committed = s.write().unwrap().apply_txn(&t);
+    Json(json!({ "committed": committed }))
 }
 async fn delete_object(State(s): State<SharedShard>, Json(b): Json<DeleteBody>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::DEL);
@@ -616,6 +627,19 @@ impl ShardClient for HttpShardClient {
             .await
             .map_err(|e| e.to_string())?;
         Ok(v.get("value").and_then(|n| n.as_i64()))
+    }
+    async fn apply_txn(&self, txn: &crate::txn::Txn) -> CResult<bool> {
+        let v: Value = self
+            .http
+            .post(format!("{}/txn", self.base))
+            .json(txn)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(v.get("committed").and_then(|c| c.as_bool()).unwrap_or(false))
     }
     async fn delete_object(&self, coll: &str, key: &str) -> CResult<()> {
         let body = DeleteBody { coll: coll.into(), key: key.into() };

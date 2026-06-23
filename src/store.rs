@@ -139,6 +139,34 @@ pub trait IndexStore {
         Some(next)
     }
 
+    /// Apply a single-shard transaction: if EVERY check holds, apply EVERY op; otherwise change
+    /// nothing. Returns whether it committed. The caller (the shard) holds the exclusive lock for the
+    /// whole call, so it is atomic + isolated; durable backends override this to also run it in one
+    /// write transaction (crash-atomic). All keys must live on this shard — see [`crate::txn`].
+    fn apply_txn(&mut self, txn: &crate::txn::Txn) -> bool {
+        use crate::txn::TxnOp;
+        // Phase 1: check every precondition against the current state.
+        for c in &txn.checks {
+            if self.get_object(&c.coll, &c.key) != c.expect {
+                return false;
+            }
+        }
+        // Phase 2: all preconditions held — apply every op.
+        for op in &txn.ops {
+            match op {
+                TxnOp::Put { coll, key, value } => self.put_object(coll, key, value.clone()),
+                TxnOp::Delete { coll, key } => self.delete_object(coll, key),
+                TxnOp::SetAdd { coll, key, member } => {
+                    self.set_add(coll, key, member);
+                }
+                TxnOp::SetRemove { coll, key, member } => {
+                    self.set_remove(coll, key, member);
+                }
+            }
+        }
+        true
+    }
+
     /// Hot-copy the durable store to `dest` — a consistent point-in-time backup taken WITHOUT
     /// quiescing the shard. The default errors (in-memory/non-durable stores have nothing on disk
     /// to copy); durable backends override it. Restore = point a fresh node's data dir at the copy.
