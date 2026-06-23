@@ -256,30 +256,20 @@ async fn geo_apply(State(c): State<Co>, Json(b): Json<crate::georep::ReplBatch>)
     let mut applied = 0usize;
     for e in &b.entries {
         match &e.op {
-            ReplOp::Put { coll, key, value } => {
-                let tk = format!("{coll}\u{1}{key}");
+            // KV writes are gated by last-writer-wins; applied via apply_repl_op so they're recorded
+            // in the WAL tagged with the source DC (so active-active won't echo them back).
+            ReplOp::Put { .. } | ReplOp::Delete { .. } => {
+                let tk = format!("{}\u{1}{}", e.op.coll(), e.op.key());
                 let last = c.get(GEO_TS, &tk).await.and_then(|v| v.as_u64()).unwrap_or(0);
                 if e.ts_ms >= last {
-                    c.put(coll, key, value.clone()).await;
+                    c.apply_repl_op(&e.op, &b.origin).await;
                     c.put(GEO_TS, &tk, json!(e.ts_ms)).await;
                     applied += 1;
                 }
             }
-            ReplOp::Delete { coll, key } => {
-                let tk = format!("{coll}\u{1}{key}");
-                let last = c.get(GEO_TS, &tk).await.and_then(|v| v.as_u64()).unwrap_or(0);
-                if e.ts_ms >= last {
-                    c.delete(coll, key).await;
-                    c.put(GEO_TS, &tk, json!(e.ts_ms)).await;
-                    applied += 1;
-                }
-            }
-            ReplOp::SetAdd { coll, key, member } => {
-                c.set_add(coll, key, member).await;
-                applied += 1;
-            }
-            ReplOp::SetRemove { coll, key, member } => {
-                c.set_remove(coll, key, member).await;
+            // Set membership converges by union — always applied (origin-tagged).
+            ReplOp::SetAdd { .. } | ReplOp::SetRemove { .. } => {
+                c.apply_repl_op(&e.op, &b.origin).await;
                 applied += 1;
             }
         }

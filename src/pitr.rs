@@ -32,6 +32,18 @@ pub enum WalOp {
     SetRemove { coll: String, key: String, member: String },
 }
 
+impl WalOp {
+    pub fn coll(&self) -> &str {
+        match self {
+            WalOp::Put { coll, .. }
+            | WalOp::PutTtl { coll, .. }
+            | WalOp::Delete { coll, .. }
+            | WalOp::SetAdd { coll, .. }
+            | WalOp::SetRemove { coll, .. } => coll,
+        }
+    }
+}
+
 /// A WAL record: a monotonic sequence, the wall-clock time it was applied, and the op.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,11 +51,21 @@ pub struct WalEntry {
     pub seq: u64,
     pub ts_ms: u64,
     pub op: WalOp,
+    /// Where this mutation came from: `None` = a local write; `Some(dc)` = applied from peer `dc` via
+    /// geo-replication. The replicator skips entries whose origin is the peer it's shipping to, so an
+    /// active-active write doesn't echo back to the DC it came from. `#[serde(default)]` keeps old
+    /// WAL records (written before this field existed) readable.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 pub trait Wal: Send + Sync {
-    /// Append an op applied at `ts_ms`; returns its sequence number.
-    fn append(&self, ts_ms: u64, op: WalOp) -> u64;
+    /// Append a locally-applied op — `append_with_origin` with no origin.
+    fn append(&self, ts_ms: u64, op: WalOp) -> u64 {
+        self.append_with_origin(ts_ms, op, None)
+    }
+    /// Append an op stamped with where it came from (`None` = local). Returns its sequence number.
+    fn append_with_origin(&self, ts_ms: u64, op: WalOp, origin: Option<String>) -> u64;
     /// All records in sequence order.
     fn entries(&self) -> Vec<WalEntry>;
     /// Drop records with `ts_ms < before` (PITR-window retention). Returns how many were removed.
@@ -106,10 +128,10 @@ impl MemoryWal {
 }
 
 impl Wal for MemoryWal {
-    fn append(&self, ts_ms: u64, op: WalOp) -> u64 {
+    fn append_with_origin(&self, ts_ms: u64, op: WalOp, origin: Option<String>) -> u64 {
         let mut v = self.inner.lock().unwrap();
         let seq = v.len() as u64 + 1;
-        v.push(WalEntry { seq, ts_ms, op });
+        v.push(WalEntry { seq, ts_ms, op, origin });
         seq
     }
     fn entries(&self) -> Vec<WalEntry> {
@@ -158,10 +180,10 @@ impl LmdbWal {
 }
 
 impl Wal for LmdbWal {
-    fn append(&self, ts_ms: u64, op: WalOp) -> u64 {
+    fn append_with_origin(&self, ts_ms: u64, op: WalOp, origin: Option<String>) -> u64 {
         let mut next = self.next.lock().unwrap();
         let seq = *next;
-        let entry = WalEntry { seq, ts_ms, op };
+        let entry = WalEntry { seq, ts_ms, op, origin };
         let mut wtxn = self.env.write_txn().expect("wal write_txn");
         self.db.put(&mut wtxn, &key(seq), &serde_json::to_string(&entry).unwrap()).expect("wal put");
         wtxn.commit().expect("wal commit");

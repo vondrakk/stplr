@@ -41,6 +41,39 @@ impl<St: IndexStore> Shard<St> {
         }
     }
 
+    /// Record a geo-replicated mutation stamped with its source DC, so the replicator won't ship it
+    /// back to where it came from.
+    fn record_origin(&self, op: WalOp, origin: &str) {
+        if let Some(w) = &self.wal {
+            w.append_with_origin(now_epoch_ms(), op, Some(origin.to_string()));
+        }
+    }
+
+    /// Apply a replicated op directly to the store AND record it to the WAL tagged with `origin`.
+    /// Used by the coordinator's geo-apply path (active-active): the write is restorable via PITR yet
+    /// is not re-shipped to the DC it originated from.
+    pub fn apply_repl_op(&mut self, op: &crate::georep::ReplOp, origin: &str) {
+        use crate::georep::ReplOp;
+        match op {
+            ReplOp::Put { coll, key, value } => {
+                self.store.put_object(coll, key, value.clone());
+                self.record_origin(WalOp::Put { coll: coll.clone(), key: key.clone(), value: value.clone() }, origin);
+            }
+            ReplOp::Delete { coll, key } => {
+                self.store.delete_object(coll, key);
+                self.record_origin(WalOp::Delete { coll: coll.clone(), key: key.clone() }, origin);
+            }
+            ReplOp::SetAdd { coll, key, member } => {
+                self.store.set_add(coll, key, member);
+                self.record_origin(WalOp::SetAdd { coll: coll.clone(), key: key.clone(), member: member.clone() }, origin);
+            }
+            ReplOp::SetRemove { coll, key, member } => {
+                self.store.set_remove(coll, key, member);
+                self.record_origin(WalOp::SetRemove { coll: coll.clone(), key: key.clone(), member: member.clone() }, origin);
+            }
+        }
+    }
+
     pub fn object(&self, coll: &str, key: &str) -> Option<Value> {
         self.store.get_object(coll, key)
     }

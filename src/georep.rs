@@ -37,6 +37,19 @@ pub enum ReplOp {
     SetRemove { coll: String, key: String, member: String },
 }
 
+impl ReplOp {
+    pub fn coll(&self) -> &str {
+        match self {
+            ReplOp::Put { coll, .. } | ReplOp::Delete { coll, .. } | ReplOp::SetAdd { coll, .. } | ReplOp::SetRemove { coll, .. } => coll,
+        }
+    }
+    pub fn key(&self) -> &str {
+        match self {
+            ReplOp::Put { key, .. } | ReplOp::Delete { key, .. } | ReplOp::SetAdd { key, .. } | ReplOp::SetRemove { key, .. } => key,
+        }
+    }
+}
+
 /// A mutation plus the wall-clock time it happened at the source (drives LWW).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -134,10 +147,14 @@ pub fn tail(log: &dyn ChangeLog, group: &str, limit: usize, ts_ms: u64, origin: 
 /// Convert PITR write-ahead-log entries into replicated ops (the comprehensive mutation source for
 /// active-passive geo-replication — the WAL captures every mutation, not just set ops). A `PutTtl`
 /// replicates as a plain `Put` (the destination applies it as a live value).
-pub fn from_wal_entries(entries: &[crate::pitr::WalEntry]) -> Vec<ReplEntry> {
+pub fn from_wal_entries(entries: &[crate::pitr::WalEntry], skip_origin: Option<&str>) -> Vec<ReplEntry> {
     use crate::pitr::WalOp;
     entries
         .iter()
+        // Never replicate the internal LWW sidecar (per-DC bookkeeping, not user data).
+        .filter(|e| e.op.coll() != GEO_TS)
+        // Active-active loop break: don't ship a write back to the DC it came from.
+        .filter(|e| skip_origin.map_or(true, |so| e.origin.as_deref() != Some(so)))
         .map(|e| {
             let op = match &e.op {
                 WalOp::Put { coll, key, value } => ReplOp::Put { coll: coll.clone(), key: key.clone(), value: value.clone() },
@@ -158,6 +175,7 @@ pub async fn replicate_once(
     client: &reqwest::Client,
     peer: &str,
     origin: &str,
+    peer_id: Option<&str>,
     group: &str,
 ) -> Result<usize, String> {
     let cursor = wal.read_cursor(group);
@@ -166,20 +184,34 @@ pub async fn replicate_once(
         return Ok(0);
     }
     let last_seq = entries.last().map(|e| e.seq).unwrap_or(cursor);
-    let batch = ReplBatch { origin: origin.to_string(), last_seq, entries: from_wal_entries(&entries) };
+    // `peer_id` set (active-active) -> drop the peer's own writes so they don't echo back.
+    let repl = from_wal_entries(&entries, peer_id);
+    if repl.is_empty() {
+        wal.commit_cursor(group, last_seq); // nothing to ship, but advance past the skipped entries
+        return Ok(0);
+    }
+    let batch = ReplBatch { origin: origin.to_string(), last_seq, entries: repl };
     let n = batch.entries.len();
     ship_batch(client, peer, &batch).await?;
     wal.commit_cursor(group, last_seq);
     Ok(n)
 }
 
-/// Active-passive replicator: forever, tail this node's PITR WAL and ship new mutations to the
-/// passive `peer` cluster's `/geo/apply`. Resumable via the durable WAL cursor (named `group`).
-pub async fn replicate_loop(wal: std::sync::Arc<dyn crate::pitr::Wal>, peer: String, origin: String, group: String, interval_ms: u64) {
+/// Replicator loop: forever, tail this node's PITR WAL and ship new mutations to `peer`'s
+/// `/geo/apply`. Resumable via the durable WAL cursor (`group`). `peer_id` set = **active-active**
+/// (skip the peer's own writes so they don't echo); `None` = active-passive (ship everything).
+pub async fn replicate_loop(
+    wal: std::sync::Arc<dyn crate::pitr::Wal>,
+    peer: String,
+    origin: String,
+    peer_id: Option<String>,
+    group: String,
+    interval_ms: u64,
+) {
     let client = reqwest::Client::new();
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(interval_ms.max(50))).await;
-        match replicate_once(wal.as_ref(), &client, &peer, &origin, &group).await {
+        match replicate_once(wal.as_ref(), &client, &peer, &origin, peer_id.as_deref(), &group).await {
             Ok(n) if n > 0 => eprintln!("geo: replicated {n} op(s) to {peer}"),
             Ok(_) => {}
             Err(e) => eprintln!("geo: replication to {peer} failed: {e}"),
@@ -319,7 +351,7 @@ mod tests {
 
         // One replication cycle ships the whole WAL and advances the cursor.
         let client = reqwest::Client::new();
-        let n = replicate_once(wal.as_ref(), &client, &peer, "src", "geo->dst").await.unwrap();
+        let n = replicate_once(wal.as_ref(), &client, &peer, "src", None, "geo->dst").await.unwrap();
         assert_eq!(n, 3, "shipped all 3 recorded mutations");
         assert_eq!(wal.read_cursor("geo->dst"), 3, "cursor advanced to the WAL head");
 
@@ -329,6 +361,27 @@ mod tests {
         assert!(tags.as_array().unwrap().iter().any(|v| v == "x"), "set member replicated");
 
         // Caught up: a second cycle ships nothing.
-        assert_eq!(replicate_once(wal.as_ref(), &client, &peer, "src", "geo->dst").await.unwrap(), 0);
+        assert_eq!(replicate_once(wal.as_ref(), &client, &peer, "src", None, "geo->dst").await.unwrap(), 0);
+    }
+
+    #[test]
+    fn active_active_does_not_echo_the_peers_own_writes() {
+        use crate::pitr::{MemoryWal, Wal, WalOp};
+        let wal = MemoryWal::new();
+        // a local write (origin None) + one that arrived from DC "B" (origin Some("B")) + the internal
+        // LWW sidecar (must never replicate)
+        wal.append(100, WalOp::Put { coll: "kv".into(), key: "local".into(), value: Value::from(1) });
+        wal.append_with_origin(200, WalOp::Put { coll: "kv".into(), key: "fromB".into(), value: Value::from(2) }, Some("B".into()));
+        wal.append(300, WalOp::Put { coll: GEO_TS.into(), key: "kv\u{1}fromB".into(), value: Value::from(200) });
+        let entries = wal.entries();
+
+        // shipping toward DC "B": skip B-origin writes (no echo) AND the sidecar -> only the local write
+        let to_b = from_wal_entries(&entries, Some("B"));
+        assert_eq!(to_b.len(), 1);
+        assert_eq!(to_b[0].op, ReplOp::Put { coll: "kv".into(), key: "local".into(), value: Value::from(1) });
+
+        // active-passive (no peer id): still drops the sidecar, keeps both data writes
+        let all = from_wal_entries(&entries, None);
+        assert_eq!(all.len(), 2);
     }
 }

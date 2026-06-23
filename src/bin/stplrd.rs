@@ -34,6 +34,9 @@ struct Args {
     // Active-passive geo-replication: tail the PITR WAL and ship to this peer cluster's /geo/apply.
     geo_peer: Option<String>,
     geo_interval_ms: u64,
+    // Active-active geo: this DC's id (origin stamp) + the peer's DC id (whose writes we don't echo).
+    geo_id: Option<String>,
+    geo_peer_id: Option<String>,
     store: String,
     path: PathBuf,
     map_size: usize,
@@ -81,8 +84,10 @@ fn print_help() {
          \x20 --resp-bind <ADDR>  Redis-compatible (RESP) listen address (shard only; e.g. 0.0.0.0:6379)\n\
          \x20 --pitr-log <DIR>    record all mutations to a PITR write-ahead log at DIR        [shard]\n\
          \x20 --pitr-restore-to <MS>  rebuild --path store from --pitr-log as of epoch-ms MS, then exit\n\
-         \x20 --geo-peer <URL>     active-passive: tail --pitr-log + ship mutations to peer's /geo/apply\n\
+         \x20 --geo-peer <URL>     tail --pitr-log + ship mutations to peer's /geo/apply\n\
          \x20 --geo-interval-ms <N>  geo-replication poll interval (default 1000)              [shard]\n\
+         \x20 --geo-id <ID>       this DC's id (origin stamp; default = node id)\n\
+         \x20 --geo-peer-id <ID>  ACTIVE-ACTIVE: the peer DC's id; its writes are not echoed back to it\n\
          \x20 --store <KIND>      memory | lmdb (default memory)            [shard]\n\
          \x20 --path <DIR>        lmdb data directory (default ./stplr-data) [shard]\n\
          \x20 --map-size <SIZE>   lmdb map ceiling, e.g. 512mb, 8gb          [shard]\n\
@@ -133,6 +138,8 @@ fn parse_args() -> Args {
         pitr_restore_to: None,
         geo_peer: None,
         geo_interval_ms: 1000,
+        geo_id: None,
+        geo_peer_id: None,
         store: "memory".into(),
         path: PathBuf::from("./stplr-data"),
         map_size: 2 * 1024 * 1024 * 1024,
@@ -166,6 +173,8 @@ fn parse_args() -> Args {
             "--pitr-restore-to" => a.pitr_restore_to = it.next().and_then(|s| s.parse().ok()),
             "--geo-peer" => a.geo_peer = it.next(),
             "--geo-interval-ms" => a.geo_interval_ms = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.geo_interval_ms),
+            "--geo-id" => a.geo_id = it.next(),
+            "--geo-peer-id" => a.geo_peer_id = it.next(),
             "--store" => a.store = it.next().unwrap_or(a.store),
             "--path" => a.path = it.next().map(PathBuf::from).unwrap_or(a.path),
             "--map-size" => a.map_size = it.next().as_deref().and_then(parse_size).unwrap_or(a.map_size),
@@ -340,10 +349,13 @@ async fn main() -> anyhow::Result<()> {
     // Active-passive geo-replication: tail the PITR WAL and ship mutations to the passive peer.
     if let Some(peer) = &args.geo_peer {
         let w = wal.clone().ok_or_else(|| anyhow::anyhow!("--geo-peer requires --pitr-log (the WAL is the replication source)"))?;
-        let (peer, origin, interval) = (peer.clone(), args.id.clone(), args.geo_interval_ms);
+        let origin = args.geo_id.clone().unwrap_or_else(|| args.id.clone()); // this DC's id
+        let peer_id = args.geo_peer_id.clone(); // Some => active-active (skip peer's own writes)
+        let (peer, interval) = (peer.clone(), args.geo_interval_ms);
         let group = format!("geo->{peer}");
-        eprintln!("stplrd '{}' geo-replicating (active-passive) to {peer} every {interval}ms", args.id);
-        tokio::spawn(stplr::georep::replicate_loop(w, peer, origin, group, interval));
+        let mode = if peer_id.is_some() { "active-active" } else { "active-passive" };
+        eprintln!("stplrd '{}' geo-replicating ({mode}) to {peer} every {interval}ms", args.id);
+        tokio::spawn(stplr::georep::replicate_loop(w, peer, origin, peer_id, group, interval));
     }
 
     // Background TTL sweeper: reclaim expired keys periodically (cheap no-op when no TTLs are set).

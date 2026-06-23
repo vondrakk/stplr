@@ -41,6 +41,10 @@ pub trait ShardClient: Send + Sync {
     async fn set_add(&self, coll: &str, key: &str, member: &str) -> CResult<bool>;
     async fn set_remove(&self, coll: &str, key: &str, member: &str) -> CResult<bool>;
     async fn write_object(&self, coll: &str, key: &str, obj: Value) -> CResult<()>;
+    /// Apply a geo-replicated op, recording it tagged with its source DC. Default no-op.
+    async fn apply_repl_op(&self, _op: &crate::georep::ReplOp, _origin: &str) -> CResult<()> {
+        Ok(())
+    }
     /// Write with a time-to-live (ms). Default ignores the TTL (writes without expiry) so backends
     /// that don't support it still compile; shard-backed clients override it.
     async fn write_object_ttl(&self, coll: &str, key: &str, obj: Value, _ttl_ms: u64) -> CResult<()> {
@@ -109,6 +113,10 @@ impl ShardClient for InProcessShardClient {
     }
     async fn write_object(&self, coll: &str, key: &str, obj: Value) -> CResult<()> {
         self.shard.write().unwrap().write_object(coll, key, obj);
+        Ok(())
+    }
+    async fn apply_repl_op(&self, op: &crate::georep::ReplOp, origin: &str) -> CResult<()> {
+        self.shard.write().unwrap().apply_repl_op(op, origin);
         Ok(())
     }
     async fn write_object_ttl(&self, coll: &str, key: &str, obj: Value, ttl_ms: u64) -> CResult<()> {
