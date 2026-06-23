@@ -167,6 +167,7 @@ pub fn app(cluster: Co) -> Router {
         .route("/write", post(write))
         .route("/cas", post(cas))
         .route("/incr", post(incr))
+        .route("/txn", post(txn))
         .route("/setAdd", post(set_add))
         .route("/setRemove", post(set_remove))
         .route("/deleteObject", post(delete_object))
@@ -210,6 +211,13 @@ async fn write(State(c): State<Co>, Json(b): Json<WriteBody>) -> Json<Value> {
         _ => c.put(&b.coll, &b.key, b.obj).await,
     }
     Json(json!({ "ok": true }))
+}
+/// Apply a single-shard transaction. 409 if its keys span shards (need a shared {hash-tag}).
+async fn txn(State(c): State<Co>, Json(t): Json<crate::txn::Txn>) -> (StatusCode, Json<Value>) {
+    match c.apply_txn(&t).await {
+        Ok(committed) => (StatusCode::OK, Json(json!({ "committed": committed }))),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "committed": false, "error": e }))),
+    }
 }
 async fn cas(State(c): State<Co>, Json(b): Json<CasBody>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::SET);
@@ -519,6 +527,48 @@ mod tests {
         );
         // empty request -> empty result
         assert!(cluster.mget("kv", &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn txn_atomic_conditional_and_colocation() {
+        use crate::txn::{Txn, TxnCheck, TxnOp};
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["s0", "s1"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            clients.insert(id.to_string(), Arc::new(HttpShardClient::new(id, &format!("http://{addr}"))));
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+        let (a, b) = ("{order:1}:a", "{order:1}:b"); // shared hash-tag -> co-located
+
+        // set-if-absent both keys atomically
+        let t = Txn {
+            checks: vec![TxnCheck { coll: "kv".into(), key: a.into(), expect: None }],
+            ops: vec![
+                TxnOp::Put { coll: "kv".into(), key: a.into(), value: json!(1) },
+                TxnOp::Put { coll: "kv".into(), key: b.into(), value: json!(2) },
+            ],
+        };
+        assert!(cluster.apply_txn(&t).await.unwrap(), "all checks pass -> commit");
+        assert_eq!(cluster.get("kv", a).await, Some(json!(1)));
+        assert_eq!(cluster.get("kv", b).await, Some(json!(2)));
+
+        // re-run: precondition now fails -> aborts, NOTHING changes (all-or-nothing)
+        let t2 = Txn {
+            checks: vec![TxnCheck { coll: "kv".into(), key: a.into(), expect: None }],
+            ops: vec![TxnOp::Put { coll: "kv".into(), key: a.into(), value: json!(99) }],
+        };
+        assert!(!cluster.apply_txn(&t2).await.unwrap(), "failed check -> abort");
+        assert_eq!(cluster.get("kv", a).await, Some(json!(1)), "aborted txn left state untouched");
+
+        // keys without a shared tag span shards -> rejected
+        let cross = Txn {
+            checks: vec![],
+            ops: vec![
+                TxnOp::Put { coll: "kv".into(), key: "x".into(), value: json!(1) },
+                TxnOp::Put { coll: "kv".into(), key: "y".into(), value: json!(1) },
+            ],
+        };
+        assert!(cluster.apply_txn(&cross).await.is_err(), "cross-shard txn rejected — needs a {{hash-tag}}");
     }
 
     #[tokio::test]
