@@ -143,6 +143,12 @@ struct KeyQ {
     key: String,
 }
 #[derive(Deserialize)]
+struct LookupQ {
+    coll: String,
+    field: String,
+    value: String,
+}
+#[derive(Deserialize)]
 struct CasBody {
     coll: String,
     key: String,
@@ -171,6 +177,7 @@ pub fn app(cluster: Co) -> Router {
         .route("/setRemove", post(set_remove))
         .route("/deleteObject", post(delete_object))
         .route("/route", get(route_info))
+        .route("/lookup", get(lookup))
         .route("/members", get(members))
         .route("/partitions", get(partitions))
         .with_state(cluster)
@@ -205,6 +212,18 @@ async fn scan(State(c): State<Co>, Query(q): Query<ScanQ>) -> Json<Value> {
 }
 async fn write(State(c): State<Co>, Json(b): Json<WriteBody>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::SET);
+    // Maintain secondary indexes synchronously: diff old vs new and update the posting lists.
+    let fields = c.index_fields_for(&b.coll);
+    if !fields.is_empty() {
+        let old = c.get(&b.coll, &b.key).await;
+        let (removes, adds) = crate::secindex::diff_write(&fields, &b.coll, old.as_ref(), &b.obj);
+        for (ic, fv) in removes {
+            c.set_remove(&ic, &fv, &b.key).await;
+        }
+        for (ic, fv) in adds {
+            c.set_add(&ic, &fv, &b.key).await;
+        }
+    }
     match b.ttl_ms {
         Some(ttl) if ttl > 0 => c.put_ttl(&b.coll, &b.key, b.obj, ttl).await,
         _ => c.put(&b.coll, &b.key, b.obj).await,
@@ -231,8 +250,21 @@ async fn set_remove(State(c): State<Co>, Json(b): Json<SetBody>) -> Json<Value> 
 }
 async fn delete_object(State(c): State<Co>, Json(b): Json<DeleteBody>) -> Json<Value> {
     crate::metrics::inc(&crate::metrics::DEL);
+    // Remove the doc from any secondary-index posting lists before deleting it.
+    let fields = c.index_fields_for(&b.coll);
+    if !fields.is_empty() {
+        if let Some(old) = c.get(&b.coll, &b.key).await {
+            for (ic, fv) in crate::secindex::diff_delete(&fields, &b.coll, &old) {
+                c.set_remove(&ic, &fv, &b.key).await;
+            }
+        }
+    }
     c.delete(&b.coll, &b.key).await;
     Json(json!({ "ok": true }))
+}
+/// Secondary-index lookup: the keys whose `field` equals `value` in `coll`.
+async fn lookup(State(c): State<Co>, Query(q): Query<LookupQ>) -> Json<Value> {
+    Json(json!({ "keys": c.index_lookup(&q.coll, &q.field, &q.value).await }))
 }
 async fn route_info(State(c): State<Co>, Query(q): Query<KeyQ>) -> Json<Value> {
     let r = c.route(&q.key);
@@ -519,6 +551,55 @@ mod tests {
         );
         // empty request -> empty result
         assert!(cluster.mget("kv", &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn secondary_index_maintained_and_queryable() {
+        let mut clients: HashMap<NodeId, Arc<dyn ShardClient>> = HashMap::new();
+        for id in ["s0", "s1"] {
+            let addr = serve_ephemeral(shared(Shard::new(id, MemoryStore::new()))).await;
+            clients.insert(id.to_string(), Arc::new(HttpShardClient::new(id, &format!("http://{addr}"))));
+        }
+        let cluster = Arc::new(Cluster::new(clients, 1, vec!["kv".into()]));
+        cluster.set_index_config(crate::secindex::IndexConfig::parse("users:status"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(cluster.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let http = reqwest::Client::new();
+        let base = format!("http://{addr}");
+        let lookup = |val: &str| {
+            let (http, base, val) = (http.clone(), base.clone(), val.to_string());
+            async move {
+                let r: Value = http
+                    .get(format!("{base}/lookup?coll=users&field=status&value={val}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let mut ks: Vec<String> = serde_json::from_value(r["keys"].clone()).unwrap();
+                ks.sort();
+                ks
+            }
+        };
+
+        for (k, st) in [("u1", "active"), ("u2", "active"), ("u3", "banned")] {
+            http.post(format!("{base}/write")).json(&json!({"coll":"users","key":k,"obj":{"status":st}})).send().await.unwrap();
+        }
+        assert_eq!(lookup("active").await, vec!["u1", "u2"], "indexed on write");
+
+        // update u2 active -> banned: index entry moves
+        http.post(format!("{base}/write")).json(&json!({"coll":"users","key":"u2","obj":{"status":"banned"}})).send().await.unwrap();
+        assert_eq!(lookup("active").await, vec!["u1"], "u2 moved out of the active index");
+        assert_eq!(lookup("banned").await, vec!["u2", "u3"]);
+
+        // delete u1: removed from the index
+        http.post(format!("{base}/deleteObject")).json(&json!({"coll":"users","key":"u1"})).send().await.unwrap();
+        assert!(lookup("active").await.is_empty(), "u1 removed from index on delete");
     }
 
     #[tokio::test]

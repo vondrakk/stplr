@@ -53,6 +53,8 @@ struct Args {
     tls_insecure: bool,
     // RBAC policy spec ("token:coll:perms;..."); when set it replaces the single --auth-token.
     policy: Option<String>,
+    // Secondary indexes: "coll:field,coll:field2,..." maintained on write (coordinator).
+    index: Option<String>,
 }
 
 /// Build the server TLS materials from `--tls-cert`/`--tls-key` (None when neither is set).
@@ -89,6 +91,7 @@ fn print_help() {
          \x20 --ingest-queue <DIR>  durable write-ahead ingest queue at DIR  [coordinator]\n\
          \x20 --auth-token <TOK>  require Bearer <TOK> on the API (or env STPLR_AUTH_TOKEN)\n\
          \x20 --policy <SPEC>     RBAC: 'token:coll:perms;...' (perms r/w/a, coll or *); replaces --auth-token\n\
+         \x20 --index <SPEC>     secondary indexes: 'coll:field,coll:field2,...' (queryable via /lookup) [coordinator]\n\
          \x20 --tls-cert <FILE>   PEM cert chain — enables TLS on the binary + HTTP transports (with --tls-key)\n\
          \x20 --tls-key <FILE>    PEM private key for --tls-cert\n\
          \x20 --tls-ca <FILE>     PEM CA to trust for coordinator->shard https (client side)\n\
@@ -140,6 +143,7 @@ fn parse_args() -> Args {
         tls_ca: None,
         tls_insecure: false,
         policy: None,
+        index: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -169,6 +173,7 @@ fn parse_args() -> Args {
             "--tls-ca" => a.tls_ca = it.next(),
             "--tls-insecure" => a.tls_insecure = true,
             "--policy" => a.policy = it.next(),
+            "--index" => a.index = it.next(),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -223,6 +228,10 @@ async fn run_coordinator(args: &Args) -> anyhow::Result<()> {
         cluster = cluster.with_topology(topology);
     }
     let cluster = Arc::new(cluster);
+    if let Some(spec) = &args.index {
+        cluster.set_index_config(stplr::secindex::IndexConfig::parse(spec));
+        eprintln!("stplrd coordinator: secondary indexes on {spec}");
+    }
     // Optional durable ingest queue (write-ahead log; crash-safe at-least-once writes).
     let queue = match &args.ingest_queue {
         Some(path) => Some(Arc::new(stplr::ingest::IngestQueue::open(path, args.map_size)?)),
