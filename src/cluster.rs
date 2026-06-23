@@ -453,6 +453,18 @@ impl Cluster {
         .await;
     }
 
+    /// Apply a geo-replicated op to every live owner of its key, recording its source DC `origin` —
+    /// so it's restorable via PITR yet isn't re-shipped back to that DC (active-active loop break).
+    pub async fn apply_repl_op(&self, op: &crate::georep::ReplOp, origin: &str) {
+        self.broadcast(op.key(), |c| {
+            let (op, origin) = (op.clone(), origin.to_string());
+            async move {
+                let _ = c.apply_repl_op(&op, &origin).await;
+            }
+        })
+        .await;
+    }
+
     /// Bulk-load pre-built objects into `coll`, routing each key to its replica set (one import per
     /// owner). The fast path for a full (re)build.
     pub async fn bulk_load(&self, coll: &str, entries: Vec<(String, Value)>) {

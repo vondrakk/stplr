@@ -7,21 +7,71 @@
 //! (US 11,151,112) lives in the engine layer, above the substrate.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::lease::{evaluate, now_epoch_ms, Lease, LeaseOutcome, LEASE_COLL};
 use crate::partitioner::bucket_of;
+use crate::pitr::{Wal, WalOp};
 use crate::store::IndexStore;
 
 pub struct Shard<St> {
     pub id: String,
     store: St,
+    /// Optional point-in-time-restore log: when set, every mutation is recorded with its time.
+    wal: Option<Arc<dyn Wal>>,
 }
 
 impl<St: IndexStore> Shard<St> {
     pub fn new(id: &str, store: St) -> Self {
-        Self { id: id.to_string(), store }
+        Self { id: id.to_string(), store, wal: None }
+    }
+
+    /// Attach a PITR write-ahead log; subsequent mutations are recorded to it.
+    pub fn with_wal(mut self, wal: Arc<dyn Wal>) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    /// Record a mutation to the PITR log (no-op when no WAL is attached).
+    fn record(&self, op: WalOp) {
+        if let Some(w) = &self.wal {
+            w.append(now_epoch_ms(), op);
+        }
+    }
+
+    /// Record a geo-replicated mutation stamped with its source DC, so the replicator won't ship it
+    /// back to where it came from.
+    fn record_origin(&self, op: WalOp, origin: &str) {
+        if let Some(w) = &self.wal {
+            w.append_with_origin(now_epoch_ms(), op, Some(origin.to_string()));
+        }
+    }
+
+    /// Apply a replicated op directly to the store AND record it to the WAL tagged with `origin`.
+    /// Used by the coordinator's geo-apply path (active-active): the write is restorable via PITR yet
+    /// is not re-shipped to the DC it originated from.
+    pub fn apply_repl_op(&mut self, op: &crate::georep::ReplOp, origin: &str) {
+        use crate::georep::ReplOp;
+        match op {
+            ReplOp::Put { coll, key, value } => {
+                self.store.put_object(coll, key, value.clone());
+                self.record_origin(WalOp::Put { coll: coll.clone(), key: key.clone(), value: value.clone() }, origin);
+            }
+            ReplOp::Delete { coll, key } => {
+                self.store.delete_object(coll, key);
+                self.record_origin(WalOp::Delete { coll: coll.clone(), key: key.clone() }, origin);
+            }
+            ReplOp::SetAdd { coll, key, member } => {
+                self.store.set_add(coll, key, member);
+                self.record_origin(WalOp::SetAdd { coll: coll.clone(), key: key.clone(), member: member.clone() }, origin);
+            }
+            ReplOp::SetRemove { coll, key, member } => {
+                self.store.set_remove(coll, key, member);
+                self.record_origin(WalOp::SetRemove { coll: coll.clone(), key: key.clone(), member: member.clone() }, origin);
+            }
+        }
     }
 
     pub fn object(&self, coll: &str, key: &str) -> Option<Value> {
@@ -39,25 +89,33 @@ impl<St: IndexStore> Shard<St> {
 
     // --- generic posting-list set ops (cluster-routed) ---
     pub fn set_add(&mut self, coll: &str, key: &str, member: &str) -> bool {
-        self.store.set_add(coll, key, member)
+        let r = self.store.set_add(coll, key, member);
+        self.record(WalOp::SetAdd { coll: coll.into(), key: key.into(), member: member.into() });
+        r
     }
     pub fn set_remove(&mut self, coll: &str, key: &str, member: &str) -> bool {
-        self.store.set_remove(coll, key, member)
+        let r = self.store.set_remove(coll, key, member);
+        self.record(WalOp::SetRemove { coll: coll.into(), key: key.into(), member: member.into() });
+        r
     }
     pub fn set_members(&self, coll: &str, key: &str) -> Vec<String> {
         self.store.set_members(coll, key)
     }
 
     pub fn write_object(&mut self, coll: &str, key: &str, obj: Value) {
+        self.record(WalOp::Put { coll: coll.into(), key: key.into(), value: obj.clone() });
         self.store.put_object(coll, key, obj);
     }
     /// Write `obj` that expires `ttl_ms` from now (the shard stamps the absolute time, so all
     /// replicas use a consistent clock source). `ttl_ms == 0` writes with no expiry.
     pub fn write_object_ttl(&mut self, coll: &str, key: &str, obj: Value, ttl_ms: u64) {
         if ttl_ms == 0 {
+            self.record(WalOp::Put { coll: coll.into(), key: key.into(), value: obj.clone() });
             self.store.put_object(coll, key, obj);
         } else {
-            self.store.put_object_at(coll, key, obj, now_epoch_ms() + ttl_ms);
+            let expire_at_ms = now_epoch_ms() + ttl_ms;
+            self.record(WalOp::PutTtl { coll: coll.into(), key: key.into(), value: obj.clone(), expire_at_ms });
+            self.store.put_object_at(coll, key, obj, expire_at_ms);
         }
     }
     /// Reclaim expired keys; returns how many were dropped.
@@ -65,20 +123,33 @@ impl<St: IndexStore> Shard<St> {
         self.store.sweep_expired(now_epoch_ms())
     }
 
-    /// Atomic compare-and-set (see [`IndexStore::cas`]).
+    /// Atomic compare-and-set (see [`IndexStore::cas`]). Recorded to the PITR log as the resulting
+    /// `Put` when it succeeds, so replay needs no condition re-evaluation.
     pub fn cas(&mut self, coll: &str, key: &str, expect: Option<Value>, new: Value) -> bool {
-        self.store.cas(coll, key, expect, new)
+        let ok = self.store.cas(coll, key, expect, new.clone());
+        if ok {
+            self.record(WalOp::Put { coll: coll.into(), key: key.into(), value: new });
+        }
+        ok
     }
-    /// Atomic integer add (see [`IndexStore::incr`]).
+    /// Atomic integer add (see [`IndexStore::incr`]). Recorded as the resulting `Put`.
     pub fn incr(&mut self, coll: &str, key: &str, delta: i64) -> Option<i64> {
-        self.store.incr(coll, key, delta)
+        let r = self.store.incr(coll, key, delta);
+        if let Some(n) = r {
+            self.record(WalOp::Put { coll: coll.into(), key: key.into(), value: Value::from(n) });
+        }
+        r
     }
     /// Group-commit many object writes (one txn on durable backends).
     pub fn write_batch(&mut self, items: Vec<(String, String, Value)>) {
+        for (c, k, v) in &items {
+            self.record(WalOp::Put { coll: c.clone(), key: k.clone(), value: v.clone() });
+        }
         self.store.put_batch(items);
     }
     pub fn delete_object(&mut self, coll: &str, key: &str) {
         self.store.delete_object(coll, key);
+        self.record(WalOp::Delete { coll: coll.into(), key: key.into() });
     }
 
     /// Hot-copy this node's durable store to `dest` (Err if the backend isn't durable).
