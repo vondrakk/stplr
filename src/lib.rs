@@ -21,6 +21,7 @@ pub mod client;
 pub mod cluster;
 pub mod config;
 pub mod coord;
+pub mod encrypt;
 pub mod guard;
 pub mod ingest;
 pub mod journal;
