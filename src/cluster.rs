@@ -84,6 +84,8 @@ pub struct Cluster {
     /// Membership epoch — bumps on every committed membership change. A direct-to-shard
     /// [`crate::smart::SmartClient`] polls this to know when to refresh its routing view.
     epoch: AtomicU64,
+    /// Secondary-index config (which value fields are indexed per collection); empty = none.
+    index: RwLock<crate::secindex::IndexConfig>,
 }
 
 impl Cluster {
@@ -105,6 +107,27 @@ impl Cluster {
             colls,
             topology: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(1),
+            index: RwLock::new(crate::secindex::IndexConfig::default()),
+        }
+    }
+
+    /// Configure secondary indexes (which value fields are indexed per collection).
+    pub fn set_index_config(&self, cfg: crate::secindex::IndexConfig) {
+        *self.index.write().unwrap() = cfg;
+    }
+
+    /// Indexed fields for `coll` (empty if none) — the coordinator uses this to maintain the index.
+    pub fn index_fields_for(&self, coll: &str) -> Vec<String> {
+        self.index.read().unwrap().fields_for(coll).to_vec()
+    }
+
+    /// Look up the keys a secondary index points at: members of the `(coll, field)` posting list for
+    /// `value`.
+    pub async fn index_lookup(&self, coll: &str, field: &str, value: &str) -> Vec<String> {
+        let ic = crate::secindex::idx_coll(coll, field);
+        match self.get(&ic, value).await {
+            Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            _ => Vec::new(),
         }
     }
 
