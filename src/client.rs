@@ -55,6 +55,10 @@ pub trait ShardClient: Send + Sync {
     async fn incr(&self, _coll: &str, _key: &str, _delta: i64) -> CResult<Option<i64>> {
         Err("incr not supported by this client".into())
     }
+    /// Apply a single-shard transaction; default unsupported. `Ok(true)` = committed.
+    async fn apply_txn(&self, _txn: &crate::txn::Txn) -> CResult<bool> {
+        Err("apply_txn not supported by this client".into())
+    }
     async fn export_entries(&self, coll: &str, buckets: Vec<usize>) -> CResult<Vec<(String, Value)>>;
     async fn import_entries(&self, coll: &str, entries: Vec<(String, Value)>) -> CResult<()>;
     async fn drop_buckets(&self, coll: &str, buckets: Vec<usize>) -> CResult<usize>;
@@ -120,6 +124,9 @@ impl ShardClient for InProcessShardClient {
     }
     async fn incr(&self, coll: &str, key: &str, delta: i64) -> CResult<Option<i64>> {
         Ok(self.shard.write().unwrap().incr(coll, key, delta))
+    }
+    async fn apply_txn(&self, txn: &crate::txn::Txn) -> CResult<bool> {
+        Ok(self.shard.write().unwrap().apply_txn(txn))
     }
     async fn delete_object(&self, coll: &str, key: &str) -> CResult<()> {
         self.shard.write().unwrap().delete_object(coll, key);

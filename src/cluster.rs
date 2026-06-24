@@ -345,6 +345,35 @@ impl Cluster {
         None
     }
 
+    /// Apply a single-shard transaction. All keys it touches must share a routing token (a
+    /// `{hash-tag}`), so they co-locate on one shard; otherwise it's rejected with `Err` — this is
+    /// single-shard ACID, not distributed 2PC. The transaction is applied to every live replica of
+    /// that shard (replication); the result is the primary's commit decision.
+    pub async fn apply_txn(&self, txn: &crate::txn::Txn) -> Result<bool, String> {
+        use crate::txn::route_token;
+        let keys = txn.keys();
+        let Some(&first) = keys.first() else {
+            return Ok(true); // empty txn trivially commits
+        };
+        let token = route_token(first);
+        if keys.iter().any(|k| route_token(k) != token) {
+            return Err("transaction keys span multiple shards — give them a shared {hash-tag} to co-locate".into());
+        }
+        let _gate = self.gates.enter(bucket_of(first)).await;
+        let mut result: Option<bool> = None;
+        for node in self.owners(first) {
+            if self.is_down(&node) {
+                continue;
+            }
+            if let Some(c) = self.client_of(&node) {
+                if let Ok(committed) = c.apply_txn(txn).await {
+                    result.get_or_insert(committed); // the primary (first live owner) decides
+                }
+            }
+        }
+        result.ok_or_else(|| "no live owner for the transaction's shard".to_string())
+    }
+
     /// Apply a write to every live owner of `key`, gated against an in-flight migration of its
     /// bucket (waits for cutover, then lands on the new owner).
     async fn broadcast<'a, F, Fut>(&'a self, key: &'a str, op: F)
