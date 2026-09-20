@@ -19,6 +19,7 @@
 pub mod changefeed;
 pub mod client;
 pub mod cluster;
+pub mod compress;
 pub mod config;
 pub mod coord;
 pub mod guard;
