@@ -77,6 +77,11 @@ impl<St: IndexStore> Shard<St> {
     pub fn write_batch(&mut self, items: Vec<(String, String, Value)>) {
         self.store.put_batch(items);
     }
+    /// Apply a single-shard transaction (all-or-nothing, conditional). The caller's exclusive shard
+    /// lock makes it isolated; the durable backend makes it crash-atomic. Returns whether it committed.
+    pub fn apply_txn(&mut self, txn: &crate::txn::Txn) -> bool {
+        self.store.apply_txn(txn)
+    }
     pub fn delete_object(&mut self, coll: &str, key: &str) {
         self.store.delete_object(coll, key);
     }

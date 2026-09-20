@@ -265,6 +265,78 @@ impl IndexStore for LmdbStore {
         wtxn.commit().expect("lmdb commit"); // one commit for the whole batch
         self.maybe_sync();
     }
+
+    /// Crash-atomic single-shard transaction. Checks run first; then every op's final per-key value
+    /// is folded in memory (safe: the caller holds the exclusive shard lock, so no writer races) and
+    /// the whole result is written in ONE LMDB transaction — atomic, isolated, durable.
+    fn apply_txn(&mut self, txn: &crate::txn::Txn) -> bool {
+        use crate::txn::TxnOp;
+        use std::collections::HashMap;
+        for c in &txn.checks {
+            if self.get_object(&c.coll, &c.key) != c.expect {
+                return false;
+            }
+        }
+        if txn.ops.is_empty() {
+            return true;
+        }
+        // Fold ops into the final value (or deletion) per (coll, key).
+        let mut working: HashMap<(String, String), Option<Value>> = HashMap::new();
+        for op in &txn.ops {
+            let k = (op.coll().to_string(), op.key().to_string());
+            let cur = working.entry(k).or_insert_with(|| self.get_object(op.coll(), op.key()));
+            match op {
+                TxnOp::Put { value, .. } => *cur = Some(value.clone()),
+                TxnOp::Delete { .. } => *cur = None,
+                TxnOp::SetAdd { member, .. } => {
+                    let mut arr: Vec<String> = cur.take().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+                    if !arr.iter().any(|m| m == member) {
+                        arr.push(member.clone());
+                    }
+                    *cur = Some(serde_json::to_value(arr).unwrap());
+                }
+                TxnOp::SetRemove { member, .. } => {
+                    let mut arr: Vec<String> = cur.take().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+                    arr.retain(|m| m != member);
+                    *cur = if arr.is_empty() { None } else { Some(serde_json::to_value(arr).unwrap()) };
+                }
+            }
+        }
+        // Write every final value in one transaction. Pre-cache db handles (their create path commits
+        // its own txn and can't nest inside the batch txn).
+        for (coll, _) in working.keys() {
+            let _ = self.db(&Self::obj_db(coll));
+        }
+        let ttl = self.has_any_ttl.load(Ordering::Relaxed);
+        if ttl {
+            let _ = self.db(EXP_DB);
+        }
+        let mut wtxn = match self.env.write_txn() {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
+        for ((coll, id), val) in &working {
+            let db = *self.dbs.lock().unwrap().get(&Self::obj_db(coll)).expect("db handle cached");
+            match val {
+                Some(v) => {
+                    let _ = db.put(&mut wtxn, id, &v.to_string());
+                }
+                None => {
+                    let _ = db.delete(&mut wtxn, id);
+                }
+            }
+            if ttl {
+                let edb = *self.dbs.lock().unwrap().get(EXP_DB).expect("exp db cached");
+                let _ = edb.delete(&mut wtxn, &Self::exp_key(coll, id));
+            }
+        }
+        if wtxn.commit().is_err() {
+            return false;
+        }
+        self.maybe_sync();
+        true
+    }
+
     fn get_object(&self, coll: &str, id: &str) -> Option<Value> {
         if self.is_expired(coll, id) {
             return None;

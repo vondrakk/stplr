@@ -27,7 +27,9 @@ fn fnv1a(s: &str) -> u32 {
 
 /// Which bucket a key id falls in. Must match the Partitioner's bucket count.
 pub fn bucket_of(key: &str) -> usize {
-    (fnv1a(key) % NUM_BUCKETS as u32) as usize
+    // Hash the routing token, not the raw key: a `{hash-tag}` makes keys co-locate on one shard
+    // (so a single-shard transaction can span them). Untagged keys hash whole, unchanged.
+    (fnv1a(crate::txn::route_token(key)) % NUM_BUCKETS as u32) as usize
 }
 
 /// HRW weight for assigning a bucket to a node.

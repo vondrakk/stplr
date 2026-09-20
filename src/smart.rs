@@ -208,6 +208,29 @@ impl SmartClient {
         None
     }
 
+    /// Apply a single-shard transaction (keys must share a `{hash-tag}` to co-locate). Applied to
+    /// every replica of the shard; the result is the primary's commit decision.
+    pub async fn apply_txn(&self, txn: &crate::txn::Txn) -> Result<bool, String> {
+        use crate::txn::route_token;
+        let keys = txn.keys();
+        let Some(&first) = keys.first() else {
+            return Ok(true);
+        };
+        let token = route_token(first);
+        if keys.iter().any(|k| route_token(k) != token) {
+            return Err("transaction keys span multiple shards — give them a shared {hash-tag} to co-locate".into());
+        }
+        let mut result: Option<bool> = None;
+        for node in self.owners(first) {
+            if let Some(c) = self.client_of(&node) {
+                if let Ok(committed) = c.apply_txn(txn).await {
+                    result.get_or_insert(committed);
+                }
+            }
+        }
+        result.ok_or_else(|| "no live owner for the transaction's shard".to_string())
+    }
+
     /// Paginated key iteration across every shard, merged + de-duplicated into one ascending page
     /// of at most `limit`. Returns `(page, next_cursor)`; pass `next_cursor` back as `after`.
     pub async fn scan_range(
